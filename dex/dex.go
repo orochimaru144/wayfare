@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -34,6 +35,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/Wayfare-labs/wayfare/asset"
+	"github.com/Wayfare-labs/wayfare/transport"
 )
 
 // DefaultHorizonURL is SDF's public mainnet Horizon instance.
@@ -43,6 +45,10 @@ const DefaultHorizonURL = "https://horizon.stellar.org"
 type Client struct {
 	HorizonURL string
 	HTTPClient *http.Client
+
+	// Logger is the structured logger for upstream call logging.
+	// Nil means slog.Default().
+	Logger *slog.Logger
 }
 
 func (c *Client) horizonURL() string {
@@ -57,6 +63,32 @@ func (c *Client) httpClient() *http.Client {
 		return c.HTTPClient
 	}
 	return &http.Client{Timeout: 20 * time.Second}
+}
+
+// ErrRateLimited reports that Horizon refused a request with HTTP 429.
+//
+// It is distinct from a generic failure because the remedy differs, and a
+// caller that cannot tell them apart treats a throttled corridor as a broken
+// one: under a monitoring schedule a 429 is routine and transient — ask again
+// after the interval — while a 500 means the upstream is unhealthy and no
+// interval fixes it. Collapsing the two would make every quota blip read as
+// an outage.
+type ErrRateLimited struct {
+	Endpoint string
+
+	// RetryAfter is what Horizon's Retry-After header asked for. Zero when
+	// the header was absent or unparseable — reported rather than guessed.
+	RetryAfter time.Duration
+}
+
+func (e *ErrRateLimited) Error() string {
+	msg := fmt.Sprintf("dex: horizon rate-limited %s", e.Endpoint)
+	if e.RetryAfter > 0 {
+		msg += fmt.Sprintf("; retry after %s", e.RetryAfter)
+	} else {
+		msg += "; horizon sent no usable Retry-After"
+	}
+	return msg
 }
 
 // Path is one route Horizon found through the DEX.
@@ -119,9 +151,20 @@ type wirePathRecord struct {
 
 type wirePathsResponse struct {
 	Embedded struct {
-		Records []wirePathRecord `json:"records"`
+		// Records are kept as raw messages rather than decoded structs so a
+		// null element — a record that is present-and-nothing at once — can
+		// be told apart from a well-formed one before it decodes into a
+		// zero-valued path and parses as a plausible "0".
+		Records []json.RawMessage `json:"records"`
 	} `json:"_embedded"`
 }
+
+// stellarMaxScale is the largest number of decimal places a Stellar move can
+// carry. Every asset — native XLM and credit assets alike — prices to at most
+// 7 decimals, and Horizon is expected to round to that. An amount with more
+// digits has been invented or mangled upstream, and silently trimming it would
+// manufacture a price none of the recorded liquidity supports.
+const stellarMaxScale = -7
 
 // StrictSendPaths asks Horizon what a fixed send amount can buy.
 //
@@ -132,6 +175,9 @@ type wirePathsResponse struct {
 //
 // Results are returned in Horizon's order, best first.
 func (c *Client) StrictSendPaths(ctx context.Context, source asset.Asset, amount decimal.Decimal, dest asset.Asset) ([]Path, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	q := url.Values{}
 	for k, v := range source.HorizonParams("source") {
 		q.Set(k, v)
@@ -145,7 +191,19 @@ func (c *Client) StrictSendPaths(ctx context.Context, source asset.Asset, amount
 	}
 
 	paths := make([]Path, 0, len(body.Embedded.Records))
-	for _, r := range body.Embedded.Records {
+	for _, raw := range body.Embedded.Records {
+		// A null record is the payload's way of saying "a path was expected
+		// here and there is nothing", which is a corruption, not a zero price.
+		// It must surface as a corrupted response rather than decode into a
+		// zero-valued path that parses as a plausible "0".
+		if strings.TrimSpace(string(raw)) == "null" {
+			return nil, fmt.Errorf("dex: strict-send response lists a null path record")
+		}
+		var r wirePathRecord
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return nil, fmt.Errorf("dex: decoding path record: %w", err)
+		}
+
 		srcAmt, err := decimal.NewFromString(r.SourceAmount)
 		if err != nil {
 			return nil, fmt.Errorf("dex: parsing source_amount %q: %w", r.SourceAmount, err)
@@ -154,6 +212,24 @@ func (c *Client) StrictSendPaths(ctx context.Context, source asset.Asset, amount
 		if err != nil {
 			return nil, fmt.Errorf("dex: parsing destination_amount %q: %w", r.DestinationAmount, err)
 		}
+		// A non-positive destination amount is a broken answer, not a bad
+		// price. Horizon never returns "you get zero or less"; when it does,
+		// pricing it against mid would render a plausible-looking 100% loss
+		// from a response that meant "no path" or "corrupted".
+		if !dstAmt.IsPositive() {
+			return nil, fmt.Errorf(
+				"dex: destination_amount %q must be positive; a non-positive amount is a "+
+					"corrupted response, not a price", r.DestinationAmount)
+		}
+		// More decimal places than a Stellar asset can carry means the amount
+		// was invented or mangled upstream. Trimming it would manufacture a
+		// price no recorded liquidity supports.
+		if dstAmt.Exponent() < stellarMaxScale {
+			return nil, fmt.Errorf(
+				"dex: destination_amount %q has %d decimal places, more than the 7 a "+
+					"Stellar asset supports", r.DestinationAmount, -dstAmt.Exponent())
+		}
+
 		p := Path{
 			SourceAsset:  source,
 			SourceAmount: srcAmt,
@@ -161,10 +237,16 @@ func (c *Client) StrictSendPaths(ctx context.Context, source asset.Asset, amount
 			DestAmount:   dstAmt,
 		}
 		for _, h := range r.Path {
-			if h.AssetType == "native" {
+			switch h.AssetType {
+			case "native":
 				p.Hops = append(p.Hops, asset.Native())
-			} else {
+			case "credit_alphanum4", "credit_alphanum12":
 				p.Hops = append(p.Hops, asset.Stellar(h.AssetCode, h.AssetIssuer))
+			default:
+				// An asset type Horizon does not emit is upstream corruption.
+				// Treating it as a hop would name a token that the recorded
+				// response never actually identified.
+				return nil, fmt.Errorf("dex: path hop has unrecognised asset_type %q", h.AssetType)
 			}
 		}
 		paths = append(paths, p)
@@ -237,7 +319,23 @@ func (c *Client) MeasureSlippage(ctx context.Context, source asset.Asset, amount
 	return s, nil
 }
 
+// pkgLogger is the package-level logger for upstream call logging.
+// Set via SetLogger; nil means slog.Default().
+var pkgLogger *slog.Logger
+
+// SetLogger configures the package-level logger for upstream call logging.
+func SetLogger(l *slog.Logger) { pkgLogger = l }
+
+func log() *slog.Logger {
+	if pkgLogger != nil {
+		return pkgLogger
+	}
+	return slog.Default()
+}
+
 func (c *Client) get(ctx context.Context, path string, q url.Values, out any) error {
+	started := time.Now()
+
 	u := c.horizonURL() + path
 	if len(q) > 0 {
 		u += "?" + q.Encode()
@@ -250,15 +348,39 @@ func (c *Client) get(ctx context.Context, path string, q url.Values, out any) er
 
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
+		log().Error("horizon request failed",
+			"service", "horizon",
+			"endpoint", path,
+			"duration", time.Since(started).Round(time.Millisecond).String(),
+			"error", transport.SanitizeTransportError(err))
 		return fmt.Errorf("dex: querying horizon: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		log().Error("horizon returned error",
+			"service", "horizon",
+			"endpoint", path,
+			"status", resp.StatusCode,
+			"duration", time.Since(started).Round(time.Millisecond).String())
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return &ErrRateLimited{Endpoint: path, RetryAfter: transport.RetryAfter(resp)}
+		}
 		return fmt.Errorf("dex: horizon returned HTTP %d for %s", resp.StatusCode, path)
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		log().Error("horizon response decode failed",
+			"service", "horizon",
+			"endpoint", path,
+			"duration", time.Since(started).Round(time.Millisecond).String(),
+			"error", err)
 		return fmt.Errorf("dex: decoding horizon response: %w", err)
 	}
+
+	log().Debug("horizon request succeeded",
+		"service", "horizon",
+		"endpoint", path,
+		"status", resp.StatusCode,
+		"duration", time.Since(started).Round(time.Millisecond).String())
 	return nil
 }

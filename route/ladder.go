@@ -4,36 +4,20 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/shopspring/decimal"
 
 	"github.com/Wayfare-labs/wayfare/asset"
+	"github.com/Wayfare-labs/wayfare/dex"
 	"github.com/Wayfare-labs/wayfare/refrate"
 )
 
 // DefaultSizes is the ladder used when a caller does not specify one.
-//
-// It spans four orders of magnitude deliberately. The bottom rung exists to
-// isolate the structural floor: at 0.1 units price impact is negligible, so
-// whatever loss remains is the corridor's spread rather than its depth. The
-// top rung exists to expose exhaustion. A ladder covering only realistic
-// remittance sizes would show a bad number without showing which of the two
-// causes produced it.
-var DefaultSizes = []decimal.Decimal{
-	decimal.RequireFromString("0.1"),
-	decimal.NewFromInt(1),
-	decimal.NewFromInt(5),
-	decimal.NewFromInt(10),
-	decimal.NewFromInt(25),
-	decimal.NewFromInt(50),
-	decimal.NewFromInt(100),
-	decimal.NewFromInt(250),
-	decimal.NewFromInt(500),
-	decimal.NewFromInt(1000),
-	decimal.NewFromInt(2500),
-	decimal.NewFromInt(5000),
-}
+// It is defined in the dex package and shared with the depth metric so
+// both measure the same corridor at the same sizes.
+var DefaultSizes = dex.DefaultSizes
 
 // ladderConcurrency bounds parallel pricing. Horizon is a shared public
 // service and a ladder is a burst of identical queries, so this stays low
@@ -57,6 +41,16 @@ type Rung struct {
 	SendAmount decimal.Decimal
 	Result     *Result
 
+	// MarginalCost is the change in effective receive-asset cost from the
+	// previous valid priced rung to this rung. It is absent for the first
+	// valid rung or when no previous valid rung exists.
+	MarginalCost *MarginalCost
+
+	// Decomposition breaks the rung's effective transfer cost into its
+	// components. It is populated when the rung priced; an unpriced rung
+	// carries an empty decomposition, which rendering omits entirely.
+	Decomposition CostDecomposition
+
 	// Err is set when this size alone failed to price, so one transient
 	// failure does not discard the whole ladder.
 	Err error
@@ -67,10 +61,32 @@ func (r Rung) Priced() bool {
 	return r.Err == nil && r.Result != nil && len(r.Result.Quotes) > 0
 }
 
+// Unmeasured reports whether this rung learned anything at all about the
+// corridor.
+//
+// Two shapes of rung learn nothing: one whose request failed before reaching
+// an upstream (Err set), and one whose request never landed, recorded by
+// Engine.Quote as a note rather than an error and arriving with no quotes and
+// IntegrityUnknown — identical in shape to NO-MARKET, but with nothing
+// learned either way. A rung Horizon answered, even "there is no path", is
+// measured: NO-MARKET is a finding about the corridor, not an outage.
+func (r Rung) Unmeasured() bool {
+	return r.Err != nil || r.Result == nil || r.Result.Integrity == IntegrityUnknown
+}
+
 // LadderResult is a corridor measured across sizes.
 type LadderResult struct {
 	Request LadderRequest
 	Rungs   []Rung
+
+	// Curve is the measured effective-rate relationship across priced and
+	// unpriced rungs. Unpriced rungs remain explicit holes; no interpolation
+	// or monotonicity assumption is applied.
+	Curve *ExecutionRateCurve
+	// MarginalClassification describes whether adjacent marginal costs are
+	// improving, flat, or worsening. It is undetermined when fewer than two
+	// valid priced points exist.
+	MarginalClassification MarginalClassification
 
 	// Integrity is the corridor's structural state across the whole ladder,
 	// which can be stronger than any single rung's. A corridor with no path
@@ -85,6 +101,10 @@ type LadderResult struct {
 	// Reference carries the full benchmark, including the second
 	// provider's mid and how far the two diverged.
 	Reference refrate.Rate
+
+	// Parallel carries the parallel/street-market reference reported
+	// alongside the official one. Nil when no parallel source is configured.
+	Parallel *refrate.Parallel
 
 	// Floor is the loss percentage at the smallest size priced. It
 	// approximates the corridor's cost with price impact removed.
@@ -112,6 +132,64 @@ type LadderResult struct {
 // Viable reports whether any size produced a recommendable route.
 func (l *LadderResult) Viable() bool { return l.Recommended != nil }
 
+// ExecutionRatePoint is one measured ladder rung. Rate is present only when
+// the rung priced; an unpriced point is represented by a hole and its reason.
+type ExecutionRatePoint struct {
+	Size   decimal.Decimal
+	Rate   decimal.Decimal
+	Priced bool
+	Reason string
+}
+
+// ExecutionRateCurve publishes the effective rate by measured size.
+type ExecutionRateCurve struct {
+	Points           []ExecutionRatePoint
+	PricedCount      int
+	ObservationCount int
+	NonMonotonic     bool
+}
+
+// buildCurve preserves the measured ladder faithfully. Rates are compared in
+// ascending size order; a missing rung neither contributes a zero nor breaks
+// the non-monotonicity check between adjacent priced observations.
+func (l *LadderResult) buildCurve() *ExecutionRateCurve {
+	curve := &ExecutionRateCurve{Points: make([]ExecutionRatePoint, 0, len(l.Rungs))}
+	var previous decimal.Decimal
+	var havePrevious bool
+	for _, r := range l.Rungs {
+		point := ExecutionRatePoint{Size: r.SendAmount, Reason: rungReason(r)}
+		if r.Priced() {
+			point.Priced = true
+			point.Rate = r.Result.Quotes[0].EffectiveRate
+			curve.PricedCount++
+			if havePrevious && point.Rate.GreaterThan(previous) {
+				curve.NonMonotonic = true
+			}
+			previous = point.Rate
+			havePrevious = true
+		}
+		curve.Points = append(curve.Points, point)
+	}
+	curve.ObservationCount = curve.PricedCount
+	if curve.PricedCount < 2 {
+		return nil
+	}
+	return curve
+}
+
+func rungReason(r Rung) string {
+	if r.Err != nil {
+		return r.Err.Error()
+	}
+	if r.Result == nil {
+		return "no result"
+	}
+	if len(r.Result.Notes) > 0 {
+		return strings.Join(r.Result.Notes, "; ")
+	}
+	return "no quote priced"
+}
+
 // Failed reports that no size was measured at all, because every request
 // failed before reaching an upstream.
 //
@@ -127,25 +205,91 @@ func (l *LadderResult) Viable() bool { return l.Recommended != nil }
 // shape to NO-MARKET. What separates them is that Horizon answering "no path"
 // yields IntegrityNoMarket, while a request that never landed leaves the state
 // IntegrityUnknown, because nothing was learned about the corridor's structure.
+//
+// # What a half-measured ladder means
+//
+// Ladder returns a result even when only some rungs could be priced; it
+// returns an error only when the run as a whole was impossible, such as a
+// cancelled context. The contract for the in-between case:
+//
+//   - Every figure — Floor, WorstLoss, Recommended, the reference fields —
+//     describes only the sizes that were measured. An unmeasured size
+//     contributes nothing: its absence is unknown, never zero loss and never
+//     no-market.
+//   - Integrity still reflects every rung that learned something. One dead
+//     size cannot erase a direct path found at another.
+//   - PartiallyFailed reports the in-between state, UnmeasuredSizes names the
+//     sizes nothing is known about, and the Finding states the qualification
+//     in prose so no reader mistakes a partial curve for a complete one.
+//   - Only Failed() — every rung unmeasured — means nothing was learned at
+//     all, and any figure the result carries is a zero-value artefact rather
+//     than a measurement.
 func (l *LadderResult) Failed() bool {
 	if len(l.Rungs) == 0 {
 		return true
 	}
 	for _, r := range l.Rungs {
-		if r.Err != nil || r.Result == nil {
-			continue
-		}
-		if r.Result.Integrity != IntegrityUnknown {
+		if !r.Unmeasured() {
 			return false
 		}
 	}
 	return true
 }
 
+// PartiallyFailed reports whether some sizes were measured while others were
+// not — the in-between case Failed does not cover.
+//
+// A half-measured ladder is a real measurement of the sizes that answered,
+// qualified by the ones that did not; it is neither a clean run nor a failed
+// one. Callers publishing figures from a ladder should consult this alongside
+// Viable(): the floor of a corridor known at three of twelve sizes is a weaker
+// claim than the same number on a full curve, and the Finding says so.
+func (l *LadderResult) PartiallyFailed() bool {
+	if len(l.Rungs) == 0 {
+		return false
+	}
+	unmeasured := 0
+	for _, r := range l.Rungs {
+		if r.Unmeasured() {
+			unmeasured++
+		}
+	}
+	return unmeasured > 0 && unmeasured < len(l.Rungs)
+}
+
+// CompletedSizes names the send amounts that were priced, in ascending order.
+func (l *LadderResult) CompletedSizes() []decimal.Decimal {
+	var out []decimal.Decimal
+	for _, r := range l.Rungs {
+		if r.Priced() {
+			out = append(out, r.SendAmount)
+		}
+	}
+	return out
+}
+
+// UnmeasuredSizes names the send amounts at which nothing was learned, in
+// ascending order. Empty means every size produced information about the
+// corridor.
+func (l *LadderResult) UnmeasuredSizes() []decimal.Decimal {
+	var out []decimal.Decimal
+	for _, r := range l.Rungs {
+		if r.Unmeasured() {
+			out = append(out, r.SendAmount)
+		}
+	}
+	return out
+}
+
 // Ladder prices a corridor at every size and summarises the curve.
 //
 // Individual sizes are priced concurrently but reported in ascending order,
 // so the output is deterministic regardless of which request returned first.
+//
+// A size that cannot be priced leaves an unmeasured rung rather than failing
+// the ladder: the returned result carries whatever the surviving sizes
+// established, and Failed, PartiallyFailed and UnmeasuredSizes separate a
+// full curve from a partial one from no measurement at all.
 func (e *Engine) Ladder(ctx context.Context, req LadderRequest) (*LadderResult, error) {
 	sizes := req.Sizes
 	if len(sizes) == 0 {
@@ -183,13 +327,79 @@ func (e *Engine) Ladder(ctx context.Context, req LadderRequest) (*LadderResult, 
 	wg.Wait()
 
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		// The partial result is returned alongside the error so a caller can
+		// report which rungs finished (CompletedSizes). It is not summarised
+		// and must not be presented as a measurement.
+		return out, err
 	}
 	out.summarise()
 	return out, nil
 }
 
-// summarise derives the ladder-level facts from the individual rungs.
+// MarginalClassification describes the direction of marginal cost as size
+// increases.
+type MarginalClassification string
+
+const (
+	MarginalImproving    MarginalClassification = "improving"
+	MarginalFlat         MarginalClassification = "flat"
+	MarginalWorsening    MarginalClassification = "worsening"
+	MarginalUndetermined MarginalClassification = "undetermined"
+)
+
+// MarginalCost is the effective cost difference between adjacent valid points.
+type MarginalCost struct {
+	From decimal.Decimal
+	To   decimal.Decimal
+	Cost decimal.Decimal
+}
+
+// computeMarginalCosts computes adjacent costs without treating missing
+// rungs as zero. The first valid point establishes the baseline; each later
+// valid point is compared with it, even when invalid points occur between them.
+func (l *LadderResult) computeMarginalCosts() {
+	var previous *Rung
+	var previousCost decimal.Decimal
+	var marginal []decimal.Decimal
+	for i := range l.Rungs {
+		r := &l.Rungs[i]
+		if !r.Priced() {
+			continue
+		}
+		cost := r.SendAmount.Mul(l.ReferenceMid).Sub(r.Result.Quotes[0].ReceiveAmount)
+		if previous != nil {
+			r.MarginalCost = &MarginalCost{From: previous.SendAmount, To: r.SendAmount, Cost: cost.Sub(previousCost)}
+			marginal = append(marginal, r.MarginalCost.Cost)
+		}
+		previous = r
+		previousCost = cost
+	}
+	if len(marginal) == 0 {
+		l.MarginalClassification = MarginalUndetermined
+		return
+	}
+	const tolerance = "0.0000001"
+	tol := decimal.RequireFromString(tolerance)
+	improving, worsening := false, false
+	for i := 1; i < len(marginal); i++ {
+		delta := marginal[i].Sub(marginal[i-1])
+		if delta.LessThan(tol.Neg()) {
+			improving = true
+		}
+		if delta.GreaterThan(tol) {
+			worsening = true
+		}
+	}
+	switch {
+	case improving && !worsening:
+		l.MarginalClassification = MarginalImproving
+	case worsening && !improving:
+		l.MarginalClassification = MarginalWorsening
+	default:
+		l.MarginalClassification = MarginalFlat
+	}
+}
+
 func (l *LadderResult) summarise() {
 	var (
 		anyPriced   bool
@@ -217,6 +427,7 @@ func (l *LadderResult) summarise() {
 			l.ReferenceMid = r.Result.ReferenceMid
 			l.ReferenceSource = r.Result.ReferenceSource
 			l.Reference = r.Result.Reference
+			l.Parallel = r.Result.Parallel
 		}
 
 		switch r.Result.Integrity {
@@ -239,6 +450,11 @@ func (l *LadderResult) summarise() {
 		}
 		anyPriced = true
 		q := r.Result.Quotes[0]
+
+		// The decomposition answers "where did the money go" for this
+		// size — the per-quote component breakdown behind the single loss
+		// percentage, computed against the corridor's reference mid.
+		l.Rungs[i].Decomposition = Decompose(q, l.ReferenceMid)
 
 		if l.FloorSize.IsZero() {
 			l.Floor, l.FloorSize = q.LossPct, r.SendAmount
@@ -274,6 +490,8 @@ func (l *LadderResult) summarise() {
 		l.Integrity = IntegrityUnknown
 	}
 
+	l.Curve = l.buildCurve()
+	l.computeMarginalCosts()
 	l.Finding = l.finding(anyPriced, firstErr)
 }
 
@@ -282,6 +500,10 @@ func (l *LadderResult) summarise() {
 // Every branch here describes a measurement. None of them recommends, and the
 // no-market and derivative cases are never folded into a loss percentage,
 // because the whole point of the taxonomy is that those are different results.
+//
+// A partially-measured ladder keeps its headline and carries the gap as a
+// qualification appended to it — the figures are real, but a reader must be
+// able to tell a full curve from a partial one.
 func (l *LadderResult) finding(anyPriced bool, firstErr error) string {
 	send, recv := l.Request.SendAsset.Code, l.Request.ReceiveAsset.Code
 
@@ -309,20 +531,40 @@ func (l *LadderResult) finding(anyPriced bool, firstErr error) string {
 			send, recv, describeAssets(l.DependsOn), recv, describeAssets(l.DependsOn))
 	}
 
+	var body string
 	if l.Viable() {
-		return prefix + fmt.Sprintf(
+		body = fmt.Sprintf(
 			"Best available: %s%% below the %s mid at %s %s, graded %s. "+
 				"Loss reaches %s%% at %s %s.",
 			l.Recommended.LossPct.StringFixed(2), l.ReferenceSource,
 			l.RecommendedSize, send, l.Recommended.Verdict,
 			l.WorstLoss.StringFixed(2), l.WorstSize, send)
+	} else {
+		body = fmt.Sprintf(
+			"No usable size. Loss against the %s mid is %s%% at %s %s — where price "+
+				"impact is negligible, so that is the corridor's structural floor, not "+
+				"a depth effect — rising to %s%% at %s %s. Every size tested is graded "+
+				"Unusable, so nothing is recommended.",
+			l.ReferenceSource, l.Floor.StringFixed(2), l.FloorSize, send,
+			l.WorstLoss.StringFixed(2), l.WorstSize, send)
 	}
 
-	return prefix + fmt.Sprintf(
-		"No usable size. Loss against the %s mid is %s%% at %s %s — where price "+
-			"impact is negligible, so that is the corridor's structural floor, not "+
-			"a depth effect — rising to %s%% at %s %s. Every size tested is graded "+
-			"Unusable, so nothing is recommended.",
-		l.ReferenceSource, l.Floor.StringFixed(2), l.FloorSize, send,
-		l.WorstLoss.StringFixed(2), l.WorstSize, send)
+	return prefix + body + l.partialQualification()
+}
+
+// partialQualification names the sizes a partially-measured ladder says
+// nothing about. It qualifies the headline; it never rewrites one.
+func (l *LadderResult) partialQualification() string {
+	sizes := l.UnmeasuredSizes()
+	if len(sizes) == 0 {
+		return ""
+	}
+	shown := make([]string, 0, len(sizes))
+	for _, s := range sizes {
+		shown = append(shown, s.String())
+	}
+	return fmt.Sprintf(
+		" %d of %d sizes could not be measured (%s), so every figure here "+
+			"describes only the sizes that were.",
+		len(sizes), len(l.Rungs), strings.Join(shown, ", "))
 }

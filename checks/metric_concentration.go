@@ -35,11 +35,14 @@ func (ConcentrationMetric) Describe() Descriptor {
 		ID:    "concentration.liquidity",
 		Scope: ScopeCorridor,
 		Cost:  CostOneRequest,
+		Venue: VenueOrderBook,
 		Title: "Liquidity concentration across price levels",
 		CanDetermine: "How concentrated the order book is across price levels, " +
 			"measured as the Herfindahl-Hirschman Index (HHI).",
 		CannotDetermine: "Account-level concentration — Horizon's /order_book " +
-			"does not expose the offering account.",
+			"does not expose the offering account — and any concentration among " +
+			"AMM liquidity pools, which the venue does not observe. See " +
+			"docs/liquidity-venues.md.",
 	}
 }
 
@@ -51,18 +54,22 @@ func (m ConcentrationMetric) Run(ctx context.Context, s Subject) MetricResult {
 	if s.Send.Code == "" || s.Receive.Code == "" {
 		return MetricUndetermined(d, s, "no send or receive asset specified")
 	}
+	if res, structural := structuralUndetermined(d, s); structural {
+		return res
+	}
 	if m.DEX == nil {
 		return MetricUndetermined(d, s, "no DEX client available to fetch the order book")
 	}
 
-	h, err := m.DEX.OrderBook(ctx, s.Send, s.Receive)
+	sell, buy, substituted := bookPair(s)
+	h, err := m.DEX.OrderBook(ctx, sell, buy)
 	if err != nil {
 		return MetricUndetermined(d, s,
 			fmt.Sprintf("order book fetch failed: %v", err))
 	}
 
 	evidence := Evidence{
-		Source:     fmt.Sprintf("/order_book %s/%s", s.Send.Code, s.Receive.Code),
+		Source:     bookSource("/order_book", s, sell, buy, substituted),
 		ObservedAt: at,
 	}
 

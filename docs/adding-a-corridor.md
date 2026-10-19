@@ -71,11 +71,11 @@ finding. What matters is that you report the status rather than skip it.
 
 ---
 
-## Step 2 — Register the asset
+## Step 2 — Register the corridor entry
 
-Everything lives in [`asset/known.go`](../asset/known.go). Use the existing
-NGNC, GHSC and KESC entries as templates; they are deliberately written to be
-copied.
+Everything lives in [`asset/known.go`](../asset/known.go). Corridor registration
+is consolidated into a single `registry` slice, so adding an asset defines its
+identity, peg, and verification status in one place.
 
 **a. The issuer account constant.** If the issuer is new, add it. If several
 tokens share one account, name the constant for the issuer rather than for one
@@ -85,71 +85,81 @@ of its tokens — `LinkIOIssuer` issues NGNC, GHSC and KESC:
 const LinkIOIssuer = "GASBV6W7GGED66MXEVC7YZHTWWYMSVYEY35USF2HJZBLABLYIFQGXZY6"
 ```
 
-**b. The verification note.** Add your asset to the package doc comment, with
-the date and the URL you read, in the same form as the existing entries:
-
-```
-// Verification status, 2026-08-08, read from
-// https://ngnc.online/.well-known/stellar.toml:
-//
-//   - GHSC   VERIFIED as published, status="pending". Same issuing account as
-//     NGNC. The anchor itself does not declare this asset in service.
-```
-
-**c. The constructor.**
+**b. The registry entry.** Add a single `Entry` struct to the `registry` slice
+in `asset/known.go`. Use the existing entries as templates:
 
 ```go
-// GHSC is the Ghanaian cedi token from the same issuer as NGNC. Its issuer
-// declares it status="pending" — not in service.
+{
+	Code:             "GHSC",
+	Issuer:           LinkIOIssuer,
+	Peg:              "GHS",
+	Status:           "pending",
+	VerificationDate: "2026-08-08",
+	SourceURL:        "https://ngnc.online/.well-known/stellar.toml",
+	HomeDomain:       "ngnc.online",
+},
+```
+
+The fields do several crucial jobs:
+
+- **`Code` & `Issuer`** identify the asset unambiguously on Stellar.
+- **`Peg`** supplies the benchmark fiat currency (ISO-4217) and makes derivative corridors detectable. A token with no registered peg cannot be measured.
+- **`Status`** records the issuer-declared SEP-1 status (`live`, `pending`, etc.).
+- **`VerificationDate` & `SourceURL`** record when and where the issuer document was verified.
+- **`HomeDomain`** binds the asset to the domain publishing its `stellar.toml`.
+
+Lookup maps (`known`, `fiatPegs`, and `homeDomains`) are derived automatically from `registry` at startup.
+
+**c. The constructor (optional).** Add a convenience constructor if the token is
+referenced directly across packages and tests:
+
+```go
+// GHSC is the Ghanaian cedi token from the same issuer as NGNC.
 func GHSC() Asset { return Stellar("GHSC", LinkIOIssuer) }
 ```
 
-**d. The `known` map**, so the API and CLI can resolve the code:
+### The fiat-peg registry and bridge assets
 
-```go
-var known = map[string]Asset{
-	"USDC": USDC(),
-	"NGNC": NGNC(),
-	"GHSC": GHSC(),
-	// yours here
-}
-```
+The `Peg` field of a registry entry is what makes a token count as a fiat
+*dependency* in `route.classify` (via `asset.ClassifyHop`, which splits hops
+into fiat / bridge / unknown). A corridor whose every path traverses a
+registered fiat token is classified `DERIVATIVE`; a token that is not in the
+registry is not a dependency, whatever its code looks like. That makes the
+registry the boundary between `DIRECT` and `DERIVATIVE`, so its rules matter:
 
----
+- **A peg is added only after it is read from the issuer's own published
+  stellar.toml** — same bar as the issuer account, per SEP-1. Never from a
+  block explorer, an aggregator, or a blog post. Record `SourceURL` and
+  `VerificationDate` exactly as the existing entries do.
+- **`status` that is not `live` is a finding, not an invitation to skip the
+  entry.** GHSC and KESC are `pending` and are registered; the status is
+  carried on the entry and reported. A token whose issuer declares it wound
+  down or dead is *not* registered as tradeable.
+- **The identity key is `CODE:ISSUER`.** Asset code alone identifies
+  nothing; anyone can issue a token called `USDC`. The registry lookups that
+  decide classification (`entries`, and therefore `fiatPegs`) are keyed by
+  `Code` + `Issuer`. Two convenience maps are derived differently and must
+  not be mistaken for identity: `known` is keyed by `Code` alone (a
+  pre-verification lookup that is only safe because the registry has one
+  entry per code), and `homeDomains` is keyed by `Issuer`.
 
-## Step 3 — Register the fiat peg
+**Bridge assets** are tokens a path routes through that are deliberately
+*not* fiat dependencies: native XLM by construction, and any issued token
+registered without a peg. The category is a stated decision — see the
+"Bridge assets" section of `asset/known.go` — not an absence from a map.
 
-This is the step that is easy to skip and should not be. In the same file:
-
-```go
-var fiatPegs = map[string]string{
-	"NGNC:" + LinkIOIssuer: "NGN",
-	"GHSC:" + LinkIOIssuer: "GHS",
-	// yours here
-}
-```
-
-The peg registry does two jobs.
-
-**It supplies the benchmark.** Nobody publishes a mid-market rate for "NGNC",
-so the token is scored against the fiat currency it claims to track. A token
-with no registered peg has nothing to be scored against, and the API refuses to
-measure it rather than guessing — which is the failure this whole project
-exists to catch.
-
-**It makes derivative corridors detectable.** In a Horizon path record, a hop
-through XLM and a hop through NGNC look identical. They are not: XLM is a
-bridge asset, while NGNC is another fiat token whose liquidity and failure
-modes the corridor then inherits. `asset.IsFiatToken` is what tells them apart,
-and it only knows what the registry tells it. An unregistered peg means a
-derivative corridor gets silently reported as `DIRECT`.
-
-Keyed by code **and** issuer, deliberately — so `NGNC` from an unrecognised
-account is never credited with the naira peg.
+**Unknown hops** are the known, bounded false-negative this registry exists to
+shrink: a hop that is neither native nor registered is treated as evidence of
+an independent market, because an unrecognised fiat stablecoin is
+indistinguishable from XLM. The gap is never silent — `route.classify`
+surfaces every unregistered hop it sees as an `Unregistered hop asset(s) …`
+note on the result and the wire. When you record a corridor, check those
+notes: each name is a candidate for the registry, verified by the same bar as
+anything else.
 
 ---
 
-## Step 4 — Measure it
+## Step 3 — Measure it
 
 ```bash
 go run ./cmd/ladder -to GHSC
@@ -187,7 +197,7 @@ go run ./cmd/ladder -to GHSC -sizes 0.1,1,10,100,1000
 
 ---
 
-## Step 5 — Record what you measured
+## Step 4 — Record what you measured
 
 If you are adding a corridor to the repository, add its figures to
 [`docs/corridor-measurements.md`](corridor-measurements.md) in the same form as
@@ -205,7 +215,7 @@ from what you inferred.
 
 ---
 
-## Step 6 — Test and open the PR
+## Step 5 — Test and open the PR
 
 ```bash
 make fmt vet test race
@@ -227,10 +237,7 @@ issuer's `stellar.toml` status for the asset.
 
 - [ ] Issuer account read live from the issuer's own `stellar.toml`, not copied
 - [ ] `NETWORK_PASSPHRASE` confirmed as public mainnet
-- [ ] Verification note added with the date and the URL
-- [ ] `status` recorded as published, whatever it says
-- [ ] Constructor added, and the code registered in `known`
-- [ ] Fiat peg registered in `fiatPegs`, keyed by code **and** issuer
+- [ ] Registered in `asset/known.go` `registry` with `Code`, `Issuer`, `Peg`, `Status`, `VerificationDate`, `SourceURL`, and `HomeDomain`
 - [ ] `go run ./cmd/ladder -to CODE` produces a sane curve
 - [ ] Integrity state is what you expect, and you can say why
 - [ ] Figures recorded in `docs/corridor-measurements.md` with a timestamp

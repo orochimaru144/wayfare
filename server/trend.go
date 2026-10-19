@@ -1,0 +1,362 @@
+package server
+
+import (
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Wayfare-labs/wayfare/analysis"
+	"github.com/Wayfare-labs/wayfare/asset"
+	"github.com/Wayfare-labs/wayfare/route"
+	"github.com/Wayfare-labs/wayfare/runstore"
+)
+
+// Wire shape for a corridor's stored history.
+//
+// These are explicit wire types for the same reason route.CorridorJSON
+// exists: runstore.Record is a storage format — versioned, hash-sealed, with
+// a field order that is part of the hash preimage — and marshalling it
+// directly would make the API a function of how records happen to be stored
+// on disk. The conversion below is the only place the two shapes meet.
+//
+// Runs come back oldest first: a timeline reads left to right. The store's
+// own Recent() returns newest first because its callers want the latest
+// record, so the handler reverses before converting.
+
+const (
+	// defaultTrendLimit is roughly twenty-five days of 6-hourly runs.
+	defaultTrendLimit = 100
+	// maxTrendLimit bounds one request's read, not the history itself.
+	maxTrendLimit = 500
+)
+
+// TrendJSON is a corridor's stored history.
+type TrendJSON struct {
+	Corridor      string          `json:"corridor"`
+	SendAsset     route.AssetJSON `json:"send_asset"`
+	ReceiveAsset  route.AssetJSON `json:"receive_asset"`
+	ReferencePair string          `json:"reference_pair"`
+
+	// Count is len(Runs), carried separately so a reader can tell an empty
+	// history from a failed request without inspecting the array.
+	Count int `json:"count"`
+
+	// Runs is oldest first. An array, never null, so a client can iterate
+	// it without a nil check when the history is empty.
+	Runs []TrendRunJSON `json:"runs"`
+
+	// IntegrityTransitions is the ordered series of determined structural
+	// changes between consecutive runs in Runs. Transitions involving UNKNOWN
+	// are omitted by runstore's integrity-transition contract.
+	IntegrityTransitions []IntegrityTransitionJSON `json:"integrity_transitions"`
+
+	// DivergenceStats summarises how far the corridor's two reference
+	// providers have disagreed across the runs above — a fact about the
+	// benchmark, not the corridor. Always present, never omitted: a benchmark
+	// that has never diverged (or a history too short to say) is reported
+	// explicitly rather than left for a client to infer from an absent key.
+	// Never feeds back into any run's verdict or integrity state above.
+	DivergenceStats DivergenceStatsJSON `json:"divergence_stats"`
+}
+
+// IntegrityTransitionJSON is one structural change in a trend window.
+type IntegrityTransitionJSON struct {
+	PreviousIntegrity string   `json:"previous_integrity"`
+	CurrentIntegrity  string   `json:"current_integrity"`
+	PreviousRunAt     string   `json:"previous_run_at"`
+	CurrentRunAt      string   `json:"current_run_at"`
+	PreviousDependsOn []string `json:"previous_depends_on"`
+	CurrentDependsOn  []string `json:"current_depends_on"`
+	TransitionType    string   `json:"transition_type"`
+}
+
+// DivergenceStatsJSON is a corridor benchmark's own longitudinal divergence:
+// how far its two reference providers have disagreed, across the same window
+// of runs the trend response carries. See analysis.DivergenceHistory.
+type DivergenceStatsJSON struct {
+	// ObservationCount is how many of the runs above actually carried a
+	// divergence figure. A run scored against a single provider (SINGLE
+	// agreement) has no divergence to report and is not counted — an
+	// unmeasured divergence is unknown, never zero, so it must not pad this
+	// count toward the minimum sample size below.
+	ObservationCount int `json:"observation_count"`
+
+	// Determined is false below the documented minimum sample size (see
+	// analysis.MinSampleSizeForMeanStdDev); Reason then explains why, and
+	// MeanPct/StdDevPct/trend are absent rather than a plausible-looking
+	// zero.
+	Determined bool   `json:"determined"`
+	Reason     string `json:"reason,omitempty"`
+
+	MeanPct   string `json:"mean_pct,omitempty"`
+	StdDevPct string `json:"stddev_pct,omitempty"`
+
+	// TrendDirection and TrendMagnitudePct are present only with enough
+	// observations for a trend (see analysis.MinSampleSizeForTrend), which
+	// is a higher bar than Determined alone: a mean can be meaningful before
+	// a trend direction is.
+	TrendDirection    string `json:"trend_direction,omitempty"`
+	TrendMagnitudePct string `json:"trend_magnitude_pct,omitempty"`
+}
+
+// toDivergenceStatsJSON renders an analysis.MetricStats for the wire.
+//
+// Regime is deliberately not rendered: analysis.DefaultRegimeThresholds is
+// calibrated to loss percentages, not to reference-provider divergence, and
+// publishing a regime label computed against the wrong scale would read as a
+// verdict this project never issued.
+func toDivergenceStatsJSON(s *analysis.MetricStats) DivergenceStatsJSON {
+	out := DivergenceStatsJSON{
+		ObservationCount: s.ObservationCount,
+		Determined:       !s.Undetermined,
+		Reason:           s.Reason,
+	}
+	if s.Mean != nil {
+		out.MeanPct = s.Mean.StringFixed(4)
+	}
+	if s.StdDev != nil {
+		out.StdDevPct = s.StdDev.StringFixed(4)
+	}
+	if s.Trend != nil {
+		out.TrendDirection = string(s.Trend.Direction)
+		out.TrendMagnitudePct = s.Trend.Magnitude.StringFixed(4)
+	}
+	return out
+}
+
+// TrendRunJSON is one stored measurement, reduced to what a trend needs:
+// the state (integrity, depends_on), the headline figures, the reference the
+// figures were scored against, and enough of each rung to plot loss by size.
+// Hash linkage and full rung detail stay in storage.
+type TrendRunJSON struct {
+	Seq        int64  `json:"seq"`
+	RecordedAt string `json:"recorded_at"`
+
+	Integrity string   `json:"integrity"`
+	DependsOn []string `json:"depends_on"`
+
+	Reference TrendRefJSON `json:"reference"`
+
+	FloorLossPct string `json:"floor_loss_pct"`
+	FloorSize    string `json:"floor_size"`
+	WorstLossPct string `json:"worst_loss_pct"`
+	WorstSize    string `json:"worst_size"`
+
+	// RecommendedSize is empty when no size produced an acceptable route,
+	// which is the normal shape of a broken corridor and must survive into
+	// the history rather than being promoted away.
+	RecommendedSize string `json:"recommended_size,omitempty"`
+
+	Finding string          `json:"finding"`
+	Rungs   []TrendRungJSON `json:"rungs"`
+}
+
+// TrendRefJSON is the reference rate a run was scored against.
+//
+// Both mids are carried when both providers answered, exactly as storage
+// does: a trend whose benchmark changed mid-series is a different question
+// from a trend whose corridor moved, and the fields that tell them apart
+// are source, secondary_source, divergence_pct and scored_against.
+type TrendRefJSON struct {
+	Mid    string `json:"mid"`
+	Source string `json:"source"`
+	AsOf   string `json:"as_of,omitempty"`
+
+	SecondaryMid    string `json:"secondary_mid,omitempty"`
+	SecondarySource string `json:"secondary_source,omitempty"`
+	DivergencePct   string `json:"divergence_pct,omitempty"`
+
+	// ScoredAgainst names which source produced the run's verdicts, so a
+	// reader looking at the loss series can see when it was scored against
+	// a different provider than the primary.
+	ScoredAgainst string `json:"scored_against,omitempty"`
+}
+
+// TrendRungJSON is one size's stored result, reduced to what a trend plots.
+type TrendRungJSON struct {
+	SendAmount string `json:"send_amount"`
+	Priced     bool   `json:"priced"`
+	LossPct    string `json:"loss_pct,omitempty"`
+	Verdict    string `json:"verdict,omitempty"`
+}
+
+// toTrendJSON renders stored records in the wire shape, preserving their
+// stored (oldest first) order.
+func toTrendJSON(recs []*runstore.Record, key, pair string, send, recv asset.Asset) TrendJSON {
+	out := TrendJSON{
+		Corridor:             key,
+		SendAsset:            route.ToAssetJSON(send),
+		ReceiveAsset:         route.ToAssetJSON(recv),
+		ReferencePair:        pair,
+		Count:                len(recs),
+		Runs:                 make([]TrendRunJSON, 0, len(recs)),
+		IntegrityTransitions: make([]IntegrityTransitionJSON, 0),
+	}
+	for _, rec := range recs {
+		out.Runs = append(out.Runs, toTrendRunJSON(rec))
+	}
+	for _, transition := range runstore.TransitionsFromRecords(recs) {
+		out.IntegrityTransitions = append(out.IntegrityTransitions, toIntegrityTransitionJSON(transition))
+	}
+	return out
+}
+
+func toIntegrityTransitionJSON(transition *runstore.IntegrityTransition) IntegrityTransitionJSON {
+	return IntegrityTransitionJSON{
+		PreviousIntegrity: transition.PreviousIntegrity,
+		CurrentIntegrity:  transition.CurrentIntegrity,
+		PreviousRunAt:     transition.PreviousRunAt.UTC().Format(time.RFC3339),
+		CurrentRunAt:      transition.CurrentRunAt.UTC().Format(time.RFC3339),
+		PreviousDependsOn: append([]string{}, transition.PreviousDependsOn...),
+		CurrentDependsOn:  append([]string{}, transition.CurrentDependsOn...),
+		TransitionType:    transition.TransitionType.String(),
+	}
+}
+
+func toTrendRunJSON(rec *runstore.Record) TrendRunJSON {
+	out := TrendRunJSON{
+		Seq:        rec.Seq,
+		RecordedAt: rec.RecordedAt.UTC().Format(time.RFC3339),
+		Integrity:  rec.Integrity,
+		DependsOn:  make([]string, 0, len(rec.DependsOn)),
+		Reference: TrendRefJSON{
+			Mid:             rec.Reference.Mid,
+			Source:          rec.Reference.Source,
+			AsOf:            rec.Reference.AsOf,
+			SecondaryMid:    rec.Reference.SecondaryMid,
+			SecondarySource: rec.Reference.SecondarySource,
+			DivergencePct:   rec.Reference.DivergencePct,
+			ScoredAgainst:   rec.Reference.ScoredAgainst,
+		},
+		FloorLossPct:    rec.FloorLossPct,
+		FloorSize:       rec.FloorSize,
+		WorstLossPct:    rec.WorstLossPct,
+		WorstSize:       rec.WorstSize,
+		RecommendedSize: rec.RecommendedSize,
+		Finding:         rec.Finding,
+		Rungs:           make([]TrendRungJSON, 0, len(rec.Rungs)),
+	}
+	out.DependsOn = append(out.DependsOn, rec.DependsOn...)
+	for _, r := range rec.Rungs {
+		out.Rungs = append(out.Rungs, TrendRungJSON{
+			SendAmount: r.SendAmount,
+			Priced:     r.Priced,
+			LossPct:    r.LossPct,
+			Verdict:    r.Verdict,
+		})
+	}
+	return out
+}
+
+// handleTrend serves a corridor's stored history, oldest first.
+//
+// It is a read endpoint: it never measures and answers from storage alone.
+// An empty history is a 200 with zero runs, not an error — a missing
+// history is not a failure of the request, it is the answer, and a client
+// that treated it as one would have to special-case the first day of
+// deployment.
+func (s *Server) handleTrend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, codeMethodNotAllowed, "only GET is supported")
+		return
+	}
+	if err := checkParams(r, "from", "to", "limit", "pretty"); err != nil {
+		writeError(w, r, http.StatusBadRequest, codeInvalidQuery, err.Error())
+		return
+	}
+
+	from := param(r, "from", "USDC")
+	to := param(r, "to", "NGNC")
+
+	sendAsset, ok := asset.Lookup(from)
+	if !ok {
+		writeError(w, r, http.StatusBadRequest, codeUnknownSendAsset, fmt.Sprintf(
+			"unknown send asset %q; verified assets are %s",
+			from, strings.Join(asset.KnownCodes(), ", ")))
+		return
+	}
+	recvAsset, ok := asset.Lookup(to)
+	if !ok {
+		writeError(w, r, http.StatusBadRequest, codeUnknownReceiveAsset, fmt.Sprintf(
+			"unknown receive asset %q; verified assets are %s",
+			to, strings.Join(asset.KnownCodes(), ", ")))
+		return
+	}
+	if _, ok := asset.FiatPeg(recvAsset); !ok {
+		writeError(w, r, http.StatusBadRequest, codeNoFiatPeg, fmt.Sprintf(
+			"no verified fiat peg for %s, so there is no independent rate to score it against",
+			recvAsset.Code))
+		return
+	}
+
+	limit, err := parseTrendLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, codeInvalidLimit, err.Error())
+		return
+	}
+
+	// The pair was fixed by the assets' pegs at measurement time, so the
+	// stored runs and this document describe the same benchmark question.
+	pegQuote, _ := asset.FiatPeg(recvAsset)
+	pegBase, ok := asset.FiatPeg(sendAsset)
+	if !ok {
+		pegBase = "USD"
+	}
+	pair := pegBase + "/" + pegQuote
+	key := runstore.CorridorKey(from, to)
+
+	var recs []*runstore.Record
+	if s.Store != nil {
+		recent, err := s.Store.Recent(r.Context(), key, limit)
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, codeStoreRead, "reading stored history: "+err.Error())
+			return
+		}
+		// Recent is newest first because its callers want the latest
+		// record; a timeline reads oldest first, so reverse.
+		recs = make([]*runstore.Record, 0, len(recent))
+		for i := len(recent) - 1; i >= 0; i-- {
+			recs = append(recs, recent[i])
+		}
+	}
+
+	trend := toTrendJSON(recs, key, pair, sendAsset, recvAsset)
+
+	stats, err := analysis.DivergenceHistory(recs)
+	if err != nil {
+		// A stored divergence_pct that fails to parse is a corrupt record,
+		// not an absent observation — the correct output is an error, not a
+		// history that silently omits the bad run.
+		writeError(w, r, http.StatusInternalServerError, codeDivergenceHistory,
+			"computing reference-divergence history: "+err.Error())
+		return
+	}
+	trend.DivergenceStats = toDivergenceStatsJSON(stats)
+
+	writeJSON(w, r, http.StatusOK, trend)
+}
+
+// parseTrendLimit bounds how much history one request may read.
+//
+// The value is clamped rather than rejected: asking for more history is not
+// a client mistake worth a 400, and a history shorter than the limit simply
+// comes back whole.
+func parseTrendLimit(raw string) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultTrendLimit, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("bad limit %q: must be a whole number", raw)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("bad limit %q: must be positive", raw)
+	}
+	if n > maxTrendLimit {
+		n = maxTrendLimit
+	}
+	return n, nil
+}

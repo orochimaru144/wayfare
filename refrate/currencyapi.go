@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
+
+	"github.com/Wayfare-labs/wayfare/transport"
 )
 
 // DefaultCurrencyAPI is the keyless endpoint of the CC0-licensed
@@ -40,6 +43,10 @@ const DefaultCurrencyAPI = "https://latest.currency-api.pages.dev/v1/currencies/
 type CurrencyAPI struct {
 	BaseURL string       // defaults to DefaultCurrencyAPI
 	Client  *http.Client // defaults to a client with a 10s timeout
+
+	// Logger is the structured logger for upstream call logging.
+	// Nil means slog.Default().
+	Logger *slog.Logger
 }
 
 // Name identifies the provider.
@@ -68,67 +75,115 @@ func (c *CurrencyAPI) baseURL() string {
 // rounding bug this project refuses everywhere else, and it is worst here,
 // where the number is the denominator of every loss percentage.
 func (c *CurrencyAPI) Rate(ctx context.Context, base, quote string) (Rate, error) {
+	started := time.Now()
+
 	base, quote = strings.ToUpper(base), strings.ToUpper(quote)
 	lowBase, lowQuote := strings.ToLower(base), strings.ToLower(quote)
 
 	url := c.baseURL() + lowBase + ".json"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return Rate{}, fmt.Errorf("refrate: building request: %w", err)
+		return Rate{}, &ErrUnavailable{Source: c.Name(), Err: fmt.Errorf("building request: %w", err)}
 	}
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.client().Do(req)
 	if err != nil {
-		return Rate{}, fmt.Errorf("refrate: fetching %s rates: %w", base, err)
+		log().Error("currency-api request failed",
+			"service", c.Name(),
+			"pair", base+"/"+quote,
+			"duration", time.Since(started).Round(time.Millisecond).String(),
+			"error", transport.SanitizeTransportError(err))
+		return Rate{}, &ErrUnavailable{Source: c.Name(), Err: err}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return Rate{}, &ErrRateLimited{Source: c.Name(), RetryAfter: retryAfter(resp)}
+		log().Warn("currency-api rate limited",
+			"service", c.Name(),
+			"pair", base+"/"+quote,
+			"duration", time.Since(started).Round(time.Millisecond).String())
+		return Rate{}, &ErrRateLimited{Source: c.Name(), RetryAfter: transport.RetryAfter(resp)}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return Rate{}, fmt.Errorf("refrate: %s returned HTTP %d", c.Name(), resp.StatusCode)
+		log().Error("currency-api returned error",
+			"service", c.Name(),
+			"pair", base+"/"+quote,
+			"status", resp.StatusCode,
+			"duration", time.Since(started).Round(time.Millisecond).String())
+		return Rate{}, &ErrUnavailable{Source: c.Name(), Err: fmt.Errorf("HTTP %d", resp.StatusCode)}
 	}
 
 	var envelope map[string]json.RawMessage
 	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
-		return Rate{}, fmt.Errorf("refrate: decoding response: %w", err)
+		log().Error("currency-api decode failed",
+			"service", c.Name(),
+			"pair", base+"/"+quote,
+			"duration", time.Since(started).Round(time.Millisecond).String(),
+			"error", err)
+		return Rate{}, &ErrUnparseable{Source: c.Name(), Err: fmt.Errorf("decoding response: %w", err)}
 	}
 
 	rates, ok := envelope[lowBase]
 	if !ok {
+		log().Error("currency-api missing base rates",
+			"service", c.Name(),
+			"pair", base+"/"+quote,
+			"duration", time.Since(started).Round(time.Millisecond).String())
 		return Rate{}, &ErrNoRate{Base: base, Quote: quote, Source: c.Name()}
 	}
 	var byCode map[string]json.RawMessage
 	if err := json.Unmarshal(rates, &byCode); err != nil {
-		return Rate{}, fmt.Errorf("refrate: decoding %s rates: %w", base, err)
+		log().Error("currency-api rates decode failed",
+			"service", c.Name(),
+			"pair", base+"/"+quote,
+			"duration", time.Since(started).Round(time.Millisecond).String(),
+			"error", err)
+		return Rate{}, &ErrUnparseable{Source: c.Name(), Err: fmt.Errorf("decoding %s rates: %w", base, err)}
 	}
 
 	raw, ok := byCode[lowQuote]
 	if !ok {
+		log().Error("currency-api missing quote rate",
+			"service", c.Name(),
+			"pair", base+"/"+quote,
+			"duration", time.Since(started).Round(time.Millisecond).String())
 		return Rate{}, &ErrNoRate{Base: base, Quote: quote, Source: c.Name()}
 	}
 	mid, err := decimal.NewFromString(string(raw))
 	if err != nil {
-		return Rate{}, fmt.Errorf("refrate: parsing %s/%s rate %q: %w", base, quote, raw, err)
+		log().Error("currency-api rate parse failed",
+			"service", c.Name(),
+			"pair", base+"/"+quote,
+			"duration", time.Since(started).Round(time.Millisecond).String(),
+			"error", err)
+		return Rate{}, &ErrUnparseable{Source: c.Name(), Err: fmt.Errorf("parsing %s/%s rate %q: %w", base, quote, raw, err)}
 	}
 	// A rate of exactly zero is absence, not a quote. Taken at face value it
 	// would divide by zero in the spread calculation, or report a route as
 	// infinitely good.
 	if mid.IsZero() {
+		log().Error("currency-api zero rate",
+			"service", c.Name(),
+			"pair", base+"/"+quote,
+			"duration", time.Since(started).Round(time.Millisecond).String())
 		return Rate{}, &ErrNoRate{Base: base, Quote: quote, Source: c.Name()}
 	}
 
-	asOf := time.Now().UTC()
+	var asOf time.Time
 	if d, ok := envelope["date"]; ok {
 		var day string
 		if json.Unmarshal(d, &day) == nil {
 			if parsed, err := time.Parse("2006-01-02", day); err == nil {
-				asOf = parsed
+				asOf = parsed.UTC()
 			}
 		}
 	}
+
+	log().Debug("currency-api rate fetched",
+		"service", c.Name(),
+		"pair", base+"/"+quote,
+		"duration", time.Since(started).Round(time.Millisecond).String())
 
 	return Rate{
 		Base:   base,

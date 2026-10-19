@@ -1,6 +1,7 @@
 package asset
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -33,10 +34,97 @@ import (
 //     issuer — but not that it is Circle's. Confirm before any mainnet
 //     execution path ships. See VerifyAgainstTOML in package anchor.
 //
+//   - NGNT   VERIFIED, 2026-08-25, read from
+//     https://cowrie.exchange/.well-known/stellar.toml. Issued by Cowrie
+//     Integrated Systems, status="live", pegged 1:1 to NGN,
+//     anchor_asset_type="fiat". NETWORK_PASSPHRASE = public mainnet.
+//     No ANCHOR_QUOTE_SERVER in the document, so the anchor publishes no
+//     machine-readable SEP-38 rate.
+//
 // The pending status on GHSC and KESC is a first-class finding, not a detail
 // to route around. Per SEP-1 only "live" means in service, and the monitor
 // reports an asset its own issuer has not launched as exactly that rather
 // than pricing it as though it were tradeable.
+//
+// Verification status, 2026-08-26, read from each issuer's own stellar.toml:
+//
+//   - NGNT   VERIFIED, status="live", read from
+//     https://cowrie.exchange/.well-known/stellar.toml. Issued by Cowrie
+//     Integrated Systems (Lagos, Nigeria), pegged 1:1 to NGN,
+//     anchor_asset_type="fiat", anchor_asset="NGN". Mainnet. The most
+//     widely-held NGNT on mainnet (tens of thousands of trustlines), so the
+//     token a naira path is likely to route through.
+//
+//   - USDZ   VERIFIED, status="live", read from
+//     https://zeam.money/.well-known/stellar.toml. Issued by Zeam Mint
+//     (Pty) Ltd, operated by Zeam SA (Pty) Ltd, regulated by the South
+//     African FSCA (FSP 53737) and SARB as a Third Party Payment Provider.
+//     The toml declares anchor_asset="USD, USDC, yUSDC, USDT" — a USD peg
+//     backed by a basket of Tier-1 stablecoins — so the peg is read as USD.
+//     Mainnet. Appeared as a hop in recorded live USDC->NGNC paths
+//     (testdata/snapshots, 2026-08-21).
+//
+//   - ZARZ   VERIFIED, status="live", read from the same zeam.money
+//     document. Issued by Zeam Mint (Pty) Ltd, pegged 1:1 to ZAR,
+//     anchor_asset_type="fiat", anchor_asset="ZAR". Mainnet. A South
+//     African rand token from a regulated issuer.
+//
+//   - EURMTL VERIFIED, status="live", read from
+//     https://mtl.montelibero.org/.well-known/stellar.toml. Issued by
+//     Montelibero, pegged 1:1 to EUR, anchor_asset_type="fiat",
+//     anchor_asset="EUR". Mainnet. The most widely-held euro stablecoin on
+//     Stellar, so a euro corridor's paths are likely to route through it.
+//
+//   - PYUSD  VERIFIED, read from
+//     https://token-metadata.paxos.com/.well-known/stellar.toml. Issued by
+//     Paxos Trust Company, powering PayPal USD, "100% backed by U.S. dollar
+//     deposits, short-term U.S Treasuries and similar cash equivalents" and
+//     "redeemable 1:1 for U.S. dollars". Mainnet. The toml declares no
+//     status field (treated as live per SEP-1) and no anchor_asset; the peg
+//     is read as USD from the description. Appeared as a hop in recorded
+//     live USDC->NGNC paths (testdata/snapshots, 2026-08-21).
+//
+// Tokens considered and deliberately NOT registered, with the reason:
+//
+//   - USDT (Tether) — https://tether.to/.well-known/stellar.toml serves the
+//     site's homepage, not a stellar.toml, so the widely-published issuer
+//     cannot be verified from its own document. Until it can, USDT hops stay
+//     in the unregistered gap rather than being guessed at.
+//
+//   - GYEN / ZUSD (GMO-Z.com Trust) — the issuer's own stellar.toml declares
+//     issuance "wound down", with 1:1 redemption available only during a
+//     fixed period ending 2026-11-11. That is not a live asset, so it is not
+//     priced as one; the wind-down is a fact about the token, not a peg to
+//     register.
+//
+//   - Stably Z-tokens (ZUSD, ZAR, ZAUD, ...) — stably.io serves no
+//     stellar.toml (HTTP 400), so no issuer account can be verified.
+//
+//   - BRL (Capitual), IDRT (Rupiah Token) — no reachable stellar.toml.
+//
+// # Bridge assets
+//
+// A bridge hop is a token a path routes through that is deliberately treated
+// as non-fiat: native XLM by construction, and any issued token registered
+// as a non-fiat bridge. The category is a stated decision, not an absence
+// from fiatPegs: XLM is not a fiat dependency because the project says so,
+// not because the map happens not to contain it.
+//
+// Tokens observed as hops in recorded live paths that fall here: BLND
+// (Blend), AQUA (Aquarius), yUSDC and wrapped BTC. None of them is
+// fiat-pegged, so routing through them does not make a corridor derivative.
+//
+// # The unknown-token false-negative
+//
+// A hop that is neither native nor registered is "unknown", and an unknown
+// hop is currently treated as evidence of an independent market — exactly
+// the same as XLM. That default is right for identification (an unrecognised
+// "NGNC" must never be assumed to track the naira) and wrong for
+// classification: an unknown fiat stablecoin routed through makes a
+// DERIVATIVE corridor look DIRECT. This is a known, bounded false-negative.
+// It is bounded because route.classify surfaces every unknown hop it sees,
+// so the gap is visible instead of silent. The fix is registration, never
+// guessing.
 const (
 	// USDCIssuer is Circle's mainnet USDC issuing account.
 	USDCIssuer = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
@@ -47,7 +135,206 @@ const (
 
 	// NGNCIssuer is retained as the original name for LinkIOIssuer.
 	NGNCIssuer = LinkIOIssuer
+
+	// CowrieIssuer issues NGNT, the naira token of Cowrie Integrated
+	// Systems. Verified 2026-08-26 from cowrie.exchange's stellar.toml.
+	CowrieIssuer = "GAWODAROMJ33V5YDFY3NPYTHVYQG7MJXVJ2ND3AOGIHYRWINES6ACCPD"
+
+	// ZeamIssuer issues USDZ, the US-dollar token of Zeam Mint (Pty) Ltd.
+	// Verified 2026-08-26 from zeam.money's stellar.toml.
+	ZeamIssuer = "GAKTLPC4ZV37SSCITQ5IS5AQ4WPF4CF4VZJQPPAROSGXMYOATF5U6XPR"
+
+	// ZeamZARIssuer issues ZARZ, Zeam's South African rand token. A
+	// separate account from ZeamIssuer, per the same stellar.toml.
+	ZeamZARIssuer = "GAROH4EV3WVVTRQKEY43GZK3XSRBEYETRVZ7SVG5LHWOAANSMCTJBB3U"
+
+	// MonteliberoIssuer issues EURMTL, the euro stablecoin of Montelibero.
+	// Verified 2026-08-26 from mtl.montelibero.org's stellar.toml.
+	MonteliberoIssuer = "GACKTN5DAZGWXRWB2WLM6OPBDHAMT6SJNGLJZPQMEZBUR4JUGBX2UK7V"
+
+	// PaxosIssuer issues PYUSD, PayPal USD, on behalf of Paxos Trust
+	// Company. Verified 2026-08-26 from token-metadata.paxos.com's
+	// stellar.toml.
+	PaxosIssuer = "GDQE7IXJ4HUHV6RQHIUPRJSEZE4DRS5WY577O2FY6YQ5LVWZ7JZTU2V5"
 )
+
+// Entry represents a verified asset or corridor registration record.
+//
+// Structured metadata fields (Status, VerificationDate, SourceURL, HomeDomain)
+// are stored directly as data so that tools and APIs can inspect them.
+type Entry struct {
+	Code             string // Asset code, e.g. "NGNC", "USDC"
+	Issuer           string // Stellar issuing account ID
+	Peg              string // ISO-4217 fiat currency tracked (e.g. "NGN"); empty for non-fiat settlement assets
+	Status           string // SEP-1 status declared by issuer: "live", "pending", "unverified", etc.
+	VerificationDate string // Date verified against issuer's stellar.toml (YYYY-MM-DD)
+	SourceURL        string // URL where stellar.toml was read
+	HomeDomain       string // Domain publishing stellar.toml
+}
+
+// CorridorEntry is an alias for Entry for backward and semantic compatibility.
+type CorridorEntry = Entry
+
+// ValidateEntry checks that a registration entry has all required fields.
+// All registered assets require Code, Issuer, Status, VerificationDate, SourceURL,
+// and HomeDomain. Corridor destination tokens additionally require Peg.
+func ValidateEntry(e Entry) error {
+	if strings.TrimSpace(e.Code) == "" {
+		return fmt.Errorf("asset code is required")
+	}
+	if strings.TrimSpace(e.Issuer) == "" {
+		return fmt.Errorf("asset %s: issuer is required", e.Code)
+	}
+	if strings.TrimSpace(e.Status) == "" {
+		return fmt.Errorf("asset %s: SEP-1 status is required", e.Code)
+	}
+	if strings.TrimSpace(e.VerificationDate) == "" {
+		return fmt.Errorf("asset %s: verification date is required", e.Code)
+	}
+	if strings.TrimSpace(e.SourceURL) == "" {
+		return fmt.Errorf("asset %s: source URL is required", e.Code)
+	}
+	if strings.TrimSpace(e.HomeDomain) == "" {
+		return fmt.Errorf("asset %s: home domain is required", e.Code)
+	}
+	// USDC is the settlement asset senders start from; all other registered assets
+	// are corridor destination tokens whose peg is mandatory.
+	if e.Code != "USDC" {
+		if strings.TrimSpace(e.Peg) == "" {
+			return fmt.Errorf("asset %s: fiat peg is required for corridor tokens", e.Code)
+		}
+	}
+	return nil
+}
+
+// registry is the single source of truth for all verified assets and corridors.
+// Maps like known, fiatPegs, and homeDomains are automatically derived from this slice.
+var registry = []Entry{
+	{
+		Code:             "USDC",
+		Issuer:           USDCIssuer,
+		Peg:              "",
+		Status:           "unverified",
+		VerificationDate: "2026-08-08",
+		SourceURL:        "https://www.circle.com/usdc/.well-known/stellar.toml",
+		HomeDomain:       "circle.com",
+	},
+	{
+		Code:             "NGNC",
+		Issuer:           LinkIOIssuer,
+		Peg:              "NGN",
+		Status:           "live",
+		VerificationDate: "2026-08-08",
+		SourceURL:        "https://ngnc.online/.well-known/stellar.toml",
+		HomeDomain:       "ngnc.online",
+	},
+	{
+		Code:             "GHSC",
+		Issuer:           LinkIOIssuer,
+		Peg:              "GHS",
+		Status:           "pending",
+		VerificationDate: "2026-08-08",
+		SourceURL:        "https://ngnc.online/.well-known/stellar.toml",
+		HomeDomain:       "ngnc.online",
+	},
+	{
+		Code:             "KESC",
+		Issuer:           LinkIOIssuer,
+		Peg:              "KES",
+		Status:           "pending",
+		VerificationDate: "2026-08-08",
+		SourceURL:        "https://ngnc.online/.well-known/stellar.toml",
+		HomeDomain:       "ngnc.online",
+	},
+	{
+		Code:             "NGNT",
+		Issuer:           CowrieIssuer,
+		Peg:              "NGN",
+		Status:           "live",
+		VerificationDate: "2026-08-26",
+		SourceURL:        "https://cowrie.exchange/.well-known/stellar.toml",
+		HomeDomain:       "cowrie.exchange",
+	},
+	{
+		Code:             "USDZ",
+		Issuer:           ZeamIssuer,
+		Peg:              "USD",
+		Status:           "live",
+		VerificationDate: "2026-08-26",
+		SourceURL:        "https://zeam.money/.well-known/stellar.toml",
+		HomeDomain:       "zeam.money",
+	},
+	{
+		Code:             "ZARZ",
+		Issuer:           ZeamZARIssuer,
+		Peg:              "ZAR",
+		Status:           "live",
+		VerificationDate: "2026-08-26",
+		SourceURL:        "https://zeam.money/.well-known/stellar.toml",
+		HomeDomain:       "zeam.money",
+	},
+	{
+		Code:             "EURMTL",
+		Issuer:           MonteliberoIssuer,
+		Peg:              "EUR",
+		Status:           "live",
+		VerificationDate: "2026-08-26",
+		SourceURL:        "https://mtl.montelibero.org/.well-known/stellar.toml",
+		HomeDomain:       "mtl.montelibero.org",
+	},
+	{
+		Code:             "PYUSD",
+		Issuer:           PaxosIssuer,
+		Peg:              "USD",
+		Status:           "live",
+		VerificationDate: "2026-08-26",
+		SourceURL:        "https://token-metadata.paxos.com/.well-known/stellar.toml",
+		HomeDomain:       "token-metadata.paxos.com",
+	},
+}
+
+var (
+	known       = make(map[string]Asset)
+	fiatPegs    = make(map[string]string)
+	homeDomains = make(map[string]string)
+	entries     = make(map[string]Entry)
+)
+
+func init() {
+	if err := validateRegistry(registry); err != nil {
+		panic(fmt.Sprintf("asset: %v", err))
+	}
+	for _, e := range registry {
+		a := Stellar(e.Code, e.Issuer)
+		known[e.Code] = a
+		if e.Peg != "" {
+			fiatPegs[e.Code+":"+e.Issuer] = e.Peg
+		}
+		if e.HomeDomain != "" {
+			homeDomains[e.Issuer] = e.HomeDomain
+		}
+		entries[e.Code+":"+e.Issuer] = e
+	}
+}
+
+// validateRegistry checks that every entry is individually valid and that no
+// two entries share a code with a different issuer. The second condition is
+// the property issue #137 exists to enforce: asset.Lookup resolves by code,
+// so two assets sharing a code but differing by issuer must never be silently
+// conflated.
+func validateRegistry(entries []Entry) error {
+	seen := make(map[string]string) // code → first issuer
+	for _, e := range entries {
+		if err := ValidateEntry(e); err != nil {
+			return fmt.Errorf("entry %q: %w", e.Code, err)
+		}
+		if prev, dup := seen[e.Code]; dup && prev != e.Issuer {
+			return fmt.Errorf("code %q registered with issuer %q and %q — two assets sharing a code with different issuers must not be conflated", e.Code, prev, e.Issuer)
+		}
+		seen[e.Code] = e.Issuer
+	}
+	return nil
+}
 
 // USDC is the settlement asset senders start from.
 func USDC() Asset { return Stellar("USDC", USDCIssuer) }
@@ -64,32 +351,22 @@ func GHSC() Asset { return Stellar("GHSC", LinkIOIssuer) }
 // declares it status="pending" — not in service.
 func KESC() Asset { return Stellar("KESC", LinkIOIssuer) }
 
-// fiatPegs records which Stellar tokens claim to track an off-chain currency,
-// and which one.
-//
-// This is what makes a derivative corridor detectable. A path hopping through
-// XLM is using a bridge asset; a path hopping through NGNC is inheriting
-// another fiat token's peg, its liquidity and its failure modes. The two look
-// identical in a Horizon path record and mean entirely different things.
-//
-// Entries are added only after the peg is read from the issuer's own
-// stellar.toml, the same standard applied to issuer accounts.
-var fiatPegs = map[string]string{
-	"NGNC:" + LinkIOIssuer: "NGN",
-	"GHSC:" + LinkIOIssuer: "GHS",
-	"KESC:" + LinkIOIssuer: "KES",
-}
+// NGNT is the naira token of Cowrie Integrated Systems, declared live by its
+// issuer. It is the most widely-held NGNT on mainnet.
+func NGNT() Asset { return Stellar("NGNT", CowrieIssuer) }
 
-// known indexes the verified tokens by code, for resolving a corridor named
-// in a request. Codes are unique here because every entry was verified
-// individually; this is a convenience over the verified set, not a namespace
-// in which asset codes are assumed unique in general.
-var known = map[string]Asset{
-	"USDC": USDC(),
-	"NGNC": NGNC(),
-	"GHSC": GHSC(),
-	"KESC": KESC(),
-}
+// USDZ is Zeam's US-dollar token, declared live by its issuer.
+func USDZ() Asset { return Stellar("USDZ", ZeamIssuer) }
+
+// ZARZ is Zeam's South African rand token, declared live by its issuer.
+func ZARZ() Asset { return Stellar("ZARZ", ZeamZARIssuer) }
+
+// EURMTL is Montelibero's euro stablecoin, declared live by its issuer.
+func EURMTL() Asset { return Stellar("EURMTL", MonteliberoIssuer) }
+
+// PYUSD is PayPal USD, issued by Paxos Trust Company, declared live by its
+// issuer (the toml omits a status field, which per SEP-1 means live).
+func PYUSD() Asset { return Stellar("PYUSD", PaxosIssuer) }
 
 // Lookup resolves a verified token by its code.
 //
@@ -100,6 +377,31 @@ func Lookup(code string) (Asset, bool) {
 	return a, ok
 }
 
+// LookupEntry returns the registration record for a given asset.
+func LookupEntry(a Asset) (Entry, bool) {
+	if a.Kind != KindStellar || a.Issuer == "" {
+		return Entry{}, false
+	}
+	e, ok := entries[a.Code+":"+a.Issuer]
+	return e, ok
+}
+
+// LookupEntryByCode returns the registration record for a given asset code.
+func LookupEntryByCode(code string) (Entry, bool) {
+	a, ok := Lookup(code)
+	if !ok {
+		return Entry{}, false
+	}
+	return LookupEntry(a)
+}
+
+// Registry returns a copy of all registered entries.
+func Registry() []Entry {
+	out := make([]Entry, len(registry))
+	copy(out, registry)
+	return out
+}
+
 // KnownCodes lists the verified token codes, sorted.
 func KnownCodes() []string {
 	codes := make([]string, 0, len(known))
@@ -108,19 +410,6 @@ func KnownCodes() []string {
 	}
 	sort.Strings(codes)
 	return codes
-}
-
-// homeDomains maps a verified issuer to the domain publishing its stellar.toml.
-//
-// Only issuers whose document was read directly appear here. The mapping is
-// what lets a check resolve an asset to the anchor that declares it, and an
-// unverified entry would send a checker to somebody else's document — which is
-// the identity confusion this package refuses everywhere else.
-//
-// USDC is deliberately absent: its issuer is still unverified against Circle's
-// own stellar.toml, so no domain can be claimed for it yet.
-var homeDomains = map[string]string{
-	LinkIOIssuer: "ngnc.online",
 }
 
 // HomeDomain reports the domain publishing an asset's stellar.toml, when the
@@ -156,6 +445,58 @@ func IsFiatToken(a Asset) bool {
 	return ok
 }
 
+// HopKind classifies a hop asset the way route.classify needs it classified.
+//
+// The three categories are deliberately distinct, and the distinction is
+// written down here rather than implied by map membership:
+//
+//   - HopFiat is a registered fiat-pegged token. A path through it inherits
+//     a fiat dependency.
+//   - HopBridge is native XLM or a registered non-fiat token (e.g. USDC).
+//     It is deliberately not a fiat dependency.
+//   - HopUnknown is a hop that is neither native nor registered. It is
+//     treated like a bridge for classification, which is the known,
+//     bounded false-negative documented in the package comment: an unknown
+//     fiat stablecoin looks exactly like XLM. The gap is surfaced, never
+//     guessed at.
+type HopKind int
+
+const (
+	HopFiat HopKind = iota
+	HopBridge
+	HopUnknown
+)
+
+// String renders the classification for a reader.
+func (k HopKind) String() string {
+	switch k {
+	case HopFiat:
+		return "fiat"
+	case HopBridge:
+		return "bridge"
+	default:
+		return "unknown"
+	}
+}
+
+// ClassifyHop reports how a hop asset is treated in corridor classification.
+func ClassifyHop(a Asset) HopKind {
+	if a.IsNative() {
+		return HopBridge
+	}
+	if a.Kind != KindStellar || a.Issuer == "" {
+		return HopUnknown
+	}
+	e, ok := entries[a.Code+":"+a.Issuer]
+	if !ok {
+		return HopUnknown
+	}
+	if e.Peg != "" {
+		return HopFiat
+	}
+	return HopBridge
+}
+
 // NGN is off-chain naira — what actually lands in a recipient's bank account.
 func NGN() Asset { return Fiat("NGN") }
 
@@ -164,3 +505,34 @@ func GHS() Asset { return Fiat("GHS") }
 
 // KES is off-chain Kenyan shilling.
 func KES() Asset { return Fiat("KES") }
+
+// IssuerConcentration identifies issuers that back multiple fiat-pegged
+// corridors. A single issuer behind multiple destination tokens means those
+// corridors share a counterparty — if that issuer fails, every corridor it
+// backs fails together. This is a market-structure fact, not a pricing
+// measurement.
+//
+// Only corridor destination tokens (assets with a non-empty Peg) are counted.
+// USDC, the settlement asset, is excluded because every corridor starts from
+// it; its concentration is a different risk (sender-side, not receiver-side).
+//
+// The result maps issuer account ID to the list of corridor asset codes it
+// issues. Issuers with only one corridor are omitted — concentration only
+// exists when one issuer backs two or more corridors.
+func IssuerConcentration() map[string][]string {
+	issuerToCorridors := make(map[string][]string)
+	for _, e := range registry {
+		if e.Code == "USDC" || e.Peg == "" {
+			continue
+		}
+		issuerToCorridors[e.Issuer] = append(issuerToCorridors[e.Issuer], e.Code)
+	}
+	// Filter to only issuers with multiple corridors.
+	result := make(map[string][]string)
+	for issuer, corridors := range issuerToCorridors {
+		if len(corridors) > 1 {
+			result[issuer] = corridors
+		}
+	}
+	return result
+}

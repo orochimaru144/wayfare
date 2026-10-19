@@ -3,6 +3,8 @@ package checks
 import (
 	"context"
 	"encoding/base32"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +18,7 @@ import (
 	"github.com/Wayfare-labs/wayfare/anchor"
 	"github.com/Wayfare-labs/wayfare/asset"
 	"github.com/Wayfare-labs/wayfare/dex"
+	"github.com/Wayfare-labs/wayfare/refrate"
 	"github.com/Wayfare-labs/wayfare/snapshot"
 )
 
@@ -92,7 +95,7 @@ func TestDescriptorRequiresItsLimits(t *testing.T) {
 		})
 	}
 
-	for _, c := range []Check{AnchorAssetISO4217{}, IssuerAuthFlags{}, SEP10EndpointResponds{}} {
+	for _, c := range []Check{AnchorAssetISO4217{}, IssuerAuthFlags{}, SEP10EndpointResponds{}, HomeDomainRoundTrip{}} {
 		d := c.Describe()
 		if err := d.Validate(); err != nil {
 			t.Errorf("%s: %v", d.ID, err)
@@ -418,6 +421,42 @@ func TestIssuerAuthFlagsNeedsAnIssuer(t *testing.T) {
 	}
 }
 
+func TestIssuerFlagImmutabilityCombinations(t *testing.T) {
+	issuer := asset.LinkIOIssuer
+	cases := []struct {
+		name, body, wantSummary string
+		passed                  bool
+	}{
+		{"clean immutable", `{"flags":{"auth_immutable":true}}`, "clean and immutable", true},
+		{"clean mutable", `{"flags":{"auth_immutable":false}}`, "clean and mutable", false},
+		{"restrictive immutable", `{"flags":{"auth_immutable":true,"auth_revocable":true}}`, "restrictive and immutable", true},
+		{"restrictive mutable", `{"flags":{"auth_immutable":false,"auth_clawback_enabled":true}}`, "restrictive and mutable", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := flagServer(t, http.StatusOK, tc.body)
+			r := IssuerFlagImmutability{HorizonURL: srv.URL, HTTPClient: srv.Client()}.Run(ctx(), Subject{Asset: asset.Stellar("USDC", issuer)})
+			if !r.Determined || r.Passed != tc.passed || !strings.Contains(r.Summary, tc.wantSummary) {
+				t.Fatalf("result = %+v, want determined=%v passed=%v summary containing %q", r, true, tc.passed, tc.wantSummary)
+			}
+			if len(r.Evidence) != 1 {
+				t.Fatal("determined result must include the observed flags as evidence")
+			}
+		})
+	}
+}
+
+func TestIssuerFlagImmutabilityUnavailableAndMissingIssuer(t *testing.T) {
+	unknown := IssuerFlagImmutability{HorizonURL: "http://127.0.0.1:1"}.Run(ctx(), Subject{Asset: asset.Stellar("USDC", asset.LinkIOIssuer)})
+	if unknown.Determined || unknown.Failed() {
+		t.Fatalf("network failure must be undetermined, got %+v", unknown)
+	}
+	missing := IssuerFlagImmutability{}.Run(ctx(), Subject{Asset: asset.Native()})
+	if missing.Determined || missing.Failed() {
+		t.Fatalf("missing issuer must be undetermined, got %+v", missing)
+	}
+}
+
 // sep10.endpoint-responds ------------------------------------------------------
 
 func sep10Profile(endpoint string) *anchor.Profile {
@@ -499,6 +538,26 @@ func TestSEP10NotDeclaredIsUndetermined(t *testing.T) {
 	}
 }
 
+// TestSEP10NoProfileIsUndetermined covers the case that precedes "not
+// declared": no stellar.toml was resolved for the anchor at all, so there is
+// nothing to read WEB_AUTH_ENDPOINT from. This must produce the same
+// not-published verdict as a resolved profile with an empty endpoint field,
+// and for the reason that specific branch names — not the generic "check
+// panicked" a nil-pointer dereference would produce if the guard were
+// removed, which is what makes this test able to fail on that mutation.
+func TestSEP10NoProfileIsUndetermined(t *testing.T) {
+	r := Run(ctx(), SEP10EndpointResponds{}, Subject{Domain: "example.test"})
+
+	if r.Determined {
+		t.Error("no resolved profile must be undetermined, not a failure — there is " +
+			"nothing declared to probe, which differs from a declared endpoint that is dead")
+	}
+	if !strings.Contains(r.Reason, "no stellar.toml has been resolved for this anchor") {
+		t.Errorf("Reason = %q, want it to name the missing profile as the cause "+
+			"(a panic-recovery reason here would mean the nil check was removed)", r.Reason)
+	}
+}
+
 // TestSEP10DeclaredButDeadIsAFailure is the other half, and the more damning
 // one: publishing an address that does not answer.
 func TestSEP10DeclaredButDeadIsAFailure(t *testing.T) {
@@ -512,6 +571,51 @@ func TestSEP10DeclaredButDeadIsAFailure(t *testing.T) {
 	}
 	if !strings.Contains(r.Summary, "did not respond") {
 		t.Errorf("Summary = %q, want it to say the endpoint did not respond", r.Summary)
+	}
+}
+
+// TestSEP10ThreeStatesAreDistinct is the discipline issue #183 asks anchor
+// checks to hold: not published, published-and-dead, and published-and-live
+// are three different facts, and none of the three tests below may collapse
+// into another. Mutating sep10_endpoint.go to treat a dead endpoint as
+// undetermined, or an absent one as a failure, breaks this test even though
+// each half already has its own dedicated test above — this is the one place
+// all three are asserted pairwise distinct in a single run.
+func TestSEP10ThreeStatesAreDistinct(t *testing.T) {
+	notPublished := Run(ctx(), SEP10EndpointResponds{}, Subject{Profile: sep10Profile("")})
+	if notPublished.Determined {
+		t.Fatal("not-published must be undetermined")
+	}
+
+	dead := Run(ctx(), SEP10EndpointResponds{}, Subject{
+		Profile: sep10Profile("https://127.0.0.1:1/auth"),
+	})
+	if !dead.Failed() {
+		t.Fatal("published-and-dead must be a determined failure")
+	}
+
+	srv := flagServer(t, 200,
+		`{"transaction":"AAAAAgAAAABmocked","network_passphrase":"Public Global Stellar Network ; September 2015"}`)
+	live := Run(ctx(), SEP10EndpointResponds{HTTPClient: srv.Client()},
+		Subject{Profile: sep10Profile(srv.URL + "/auth")})
+	if !live.Determined || !live.Passed {
+		t.Fatal("published-and-live must be a determined pass")
+	}
+
+	// Pairwise: no two of the three share both Determined and Passed, which
+	// is what would let a reader mistake one state for another downstream.
+	states := []struct {
+		name string
+		r    CheckResult
+	}{{"not-published", notPublished}, {"dead", dead}, {"live", live}}
+	for i := range states {
+		for j := i + 1; j < len(states); j++ {
+			a, b := states[i], states[j]
+			if a.r.Determined == b.r.Determined && a.r.Passed == b.r.Passed {
+				t.Errorf("%s and %s collapsed into the same (determined, passed) pair: (%v, %v)",
+					a.name, b.name, a.r.Determined, a.r.Passed)
+			}
+		}
 	}
 }
 
@@ -667,6 +771,68 @@ func TestSEP10GenuineErrorStillFails(t *testing.T) {
 	}
 }
 
+// sep24.info-lists-asset ------------------------------------------------------
+
+func sep24Profile(server string) *anchor.Profile {
+	return &anchor.Profile{
+		Domain: "example.test",
+		TOML: anchor.TOML{
+			TransferServer24: server,
+			Currencies:       []anchor.Currency{{Code: "NGNC", Issuer: "GISSUER", AnchorAsset: "NGN"}},
+		},
+	}
+}
+
+func TestSEP24InfoListsAsset(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     int
+		body       string
+		determined bool
+		passed     bool
+		contains   string
+	}{
+		{name: "deposit and withdrawal enabled", status: 200,
+			body:       `{"deposit":{"NGN":{"enabled":true}},"withdraw":{"NGN":{"enabled":true}}}`,
+			determined: true, passed: true, contains: "deposit enabled; withdrawal enabled"},
+		{name: "deposit enabled and withdrawal disabled", status: 200,
+			body:       `{"deposit":{"NGN":{"enabled":true}},"withdraw":{"NGN":{"enabled":false}}}`,
+			determined: true, passed: true, contains: "deposit enabled; withdrawal disabled"},
+		{name: "withdrawal enabled and deposit disabled", status: 200,
+			body:       `{"deposit":{"NGN":{"enabled":false}},"withdraw":{"NGN":{"enabled":true}}}`,
+			determined: true, passed: true, contains: "deposit disabled; withdrawal enabled"},
+		{name: "asset omitted", status: 200,
+			body:       `{"deposit":{"USD":{"enabled":true}},"withdraw":{"USD":{"enabled":true}}}`,
+			determined: true, passed: false, contains: "omits asset \"NGN\""},
+		{name: "server error", status: 503, body: `{}`,
+			determined: true, passed: false, contains: "HTTP 503"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := flagServer(t, tc.status, tc.body)
+			r := Run(ctx(), SEP24InfoListsAsset{HTTPClient: srv.Client()},
+				Subject{Asset: asset.Stellar("NGNC", "GISSUER"), Profile: sep24Profile(srv.URL)})
+			if r.Determined != tc.determined || (tc.determined && r.Passed != tc.passed) {
+				t.Fatalf("result determined=%v passed=%v, want %v/%v (%s)", r.Determined, r.Passed, tc.determined, tc.passed, r.Summary)
+			}
+			if !strings.Contains(r.Summary+" "+r.Reason, tc.contains) {
+				t.Errorf("result %q / %q does not mention %q", r.Summary, r.Reason, tc.contains)
+			}
+			if len(r.Evidence) == 0 {
+				t.Error("result has no evidence")
+			}
+		})
+	}
+}
+
+func TestSEP24InfoNotDeclaredIsUndetermined(t *testing.T) {
+	r := Run(ctx(), SEP24InfoListsAsset{}, Subject{Asset: asset.Stellar("NGNC", "GISSUER"), Profile: sep24Profile("")})
+	if r.Determined || !strings.Contains(r.Reason, "declares no TRANSFER_SERVER_SEP0024") {
+		t.Fatalf("result = determined=%v reason=%q, want undetermined absent server", r.Determined, r.Reason)
+	}
+}
+
 // SSRF guard ------------------------------------------------------------------
 
 // TestGuardRejectsInternalTargets is the attack CodeRabbit identified.
@@ -794,6 +960,9 @@ func TestSpreadMetricFromRecordedBook(t *testing.T) {
 	if !r.Value.IsPositive() {
 		t.Errorf("spread = %s, want positive on a real book", r.Value)
 	}
+	if len(r.Evidence) == 0 || !strings.Contains(r.Evidence[0].Observed, "mid=") {
+		t.Errorf("spread evidence = %+v, want the independently useful book mid", r.Evidence)
+	}
 	if len(r.Evidence) == 0 {
 		t.Error("no evidence recorded")
 	}
@@ -889,6 +1058,18 @@ func TestDepthObservedMetric(t *testing.T) {
 	}
 }
 
+func TestDepthObservedEmptyBook(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "xlm-ngnc-orderbook-empty")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	depth := DepthMetric{DEX: c}
+	r := depth.RunObserved(ctx(), Subject{Send: asset.Native(), Receive: asset.NGNC()})
+
+	if r.Determined {
+		t.Error("empty book must produce an undetermined result, not a level count of zero")
+	}
+}
+
 func TestDepthExecutableMetric(t *testing.T) {
 	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend")
 	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
@@ -913,7 +1094,11 @@ func TestDepthExecutableMetric(t *testing.T) {
 	}
 }
 
-func TestDepthNoPathsProducesUndetermined(t *testing.T) {
+// TestDepthExhaustedProducesDeterminedZero pins that a book that runs out
+// at every probed size produces a determined result with zero, not an
+// undetermined one. This is the core distinction of issue #158: a measured
+// absence of liquidity is not the same as an unmeasurable one.
+func TestDepthExhaustedProducesDeterminedZero(t *testing.T) {
 	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend-empty")
 	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
 
@@ -926,19 +1111,21 @@ func TestDepthNoPathsProducesUndetermined(t *testing.T) {
 		Receive: asset.NGNC(),
 	})
 
-	if r.Determined {
-		t.Error("no paths must produce an undetermined result")
+	if !r.Determined {
+		t.Fatalf("depth exhausted must be determined, got undetermined: %s", r.Reason)
 	}
-	want := "no path found at any of the 1 sizes probed"
-	if r.Reason != want {
-		t.Errorf("Reason = %q, want %q", r.Reason, want)
+	if !r.Value.IsZero() {
+		t.Errorf("depth exhausted value = %s, want zero", r.Value)
+	}
+	if r.Unit != UnitAmount {
+		t.Errorf("unit = %s, want amount", r.Unit)
 	}
 	if len(r.Evidence) == 0 {
-		t.Error("expected at least one evidence entry explaining the failure")
+		t.Error("expected at least one evidence entry explaining the exhaustion")
 	} else {
 		e := r.Evidence[0]
-		if !strings.Contains(e.Observed, "probed 1 sizes, no path found") {
-			t.Errorf("Evidence[0].Observed = %q, want it to contain 'probed 1 sizes, no path found'", e.Observed)
+		if !strings.Contains(e.Observed, "no path found at any size") {
+			t.Errorf("Evidence[0].Observed = %q, want it to note exhaustion", e.Observed)
 		}
 		if e.Source == "" {
 			t.Error("Evidence[0].Source is blank — a metric must name its data source")
@@ -949,10 +1136,983 @@ func TestDepthNoPathsProducesUndetermined(t *testing.T) {
 	}
 }
 
+// TestDepthExhaustedMultipleSizes pins that exhaustion across multiple sizes
+// is still a determined result — each size was successfully queried, and the
+// answer was consistently "no path".
+func TestDepthExhaustedMultipleSizes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Every size returns an empty path list — the book is exhausted.
+		_, _ = w.Write([]byte(`{"_embedded":{"records":[]}}`))
+	}))
+	defer srv.Close()
+
+	c := &dex.Client{HorizonURL: srv.URL}
+	depth := DepthMetric{
+		DEX:   c,
+		Sizes: []decimal.Decimal{decimal.NewFromInt(1), decimal.NewFromInt(100)},
+	}
+	r := depth.RunExecutable(ctx(), Subject{
+		Send:    asset.USDC(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("depth exhausted across sizes must be determined, got undetermined: %s", r.Reason)
+	}
+	if !r.Value.IsZero() {
+		t.Errorf("depth exhausted value = %s, want zero", r.Value)
+	}
+}
+
+// TestDepthProbeErrorsRemainUndetermined pins that probe failures — the
+// request never reached an upstream — produce undetermined, not exhausted.
+func TestDepthProbeErrorsRemainUndetermined(t *testing.T) {
+	// A client pointed at nothing: every probe will fail before reaching
+	// an upstream. The result must be undetermined, not determined-zero
+	// (which would read as "measured no liquidity" rather than "could not
+	// measure at all").
+	c := &dex.Client{HorizonURL: "http://127.0.0.1:1"}
+
+	depth := DepthMetric{
+		DEX:   c,
+		Sizes: []decimal.Decimal{decimal.NewFromInt(1)},
+	}
+	r := depth.RunExecutable(ctx(), Subject{
+		Send:    asset.USDC(),
+		Receive: asset.NGNC(),
+	})
+
+	if r.Determined {
+		t.Error("probe errors must produce an undetermined result, not a determined one")
+	}
+	if r.Reason == "" {
+		t.Error("undetermined result must carry a reason")
+	}
+}
+
+// TestDepthMixedExhaustedAndErrored covers the case where some sizes priced
+// and others hit probe errors. The measured sizes give real data; the failed
+// sizes are unknown, never zero.
+func TestDepthMixedExhaustedAndErrored(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		amount := r.URL.Query().Get("source_amount")
+		d, err := decimal.NewFromString(amount)
+		if err != nil {
+			http.Error(w, "bad amount", http.StatusBadRequest)
+			return
+		}
+		// Small sizes succeed, large sizes fail
+		if d.GreaterThanOrEqual(decimal.NewFromInt(100)) {
+			http.Error(w, "internal", http.StatusInternalServerError)
+			return
+		}
+		dest := d.Mul(decimal.RequireFromString("1300"))
+		_, _ = w.Write([]byte(`{"_embedded":{"records":[{
+			"source_asset_type":"credit_alphanum4","source_asset_code":"USDC",
+			"source_amount":"` + amount + `",
+			"destination_asset_type":"credit_alphanum4","destination_asset_code":"NGNC",
+			"destination_amount":"` + dest.String() + `","path":[]}]}}`))
+	}))
+	defer srv.Close()
+
+	c := &dex.Client{HorizonURL: srv.URL}
+	depth := DepthMetric{
+		DEX:   c,
+		Sizes: []decimal.Decimal{decimal.NewFromInt(1), decimal.NewFromInt(100)},
+	}
+	r := depth.RunExecutable(ctx(), Subject{
+		Send:    asset.USDC(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("mixed exhausted+errored must be determined with measured sizes, got undetermined: %s", r.Reason)
+	}
+	if !r.Value.IsPositive() {
+		t.Errorf("executable amount = %s, want positive from the measured size", r.Value)
+	}
+	if !strings.Contains(r.Summary, "1 of 2 sizes measured") {
+		t.Errorf("Summary = %q, want it to note partial measurement", r.Summary)
+	}
+}
+
 func TestDepthMetricDescriptorIsValid(t *testing.T) {
 	d := DepthMetric{}.Describe()
 	if err := d.Validate(); err != nil {
 		t.Errorf("depth metric descriptor: %v", err)
+	}
+}
+
+// TestDepthDefaultSizesMatchLadder verifies that the depth metric's default
+// sizes are the same as dex.DefaultSizes (the shared ladder), so both the
+// route ladder and the depth metric measure the same corridor at the same
+// sizes.
+func TestDepthDefaultSizesMatchLadder(t *testing.T) {
+	if len(defaultDepthSizes) != len(dex.DefaultSizes) {
+		t.Fatalf("defaultDepthSizes has %d sizes, dex.DefaultSizes has %d",
+			len(defaultDepthSizes), len(dex.DefaultSizes))
+	}
+	for i := range defaultDepthSizes {
+		if !defaultDepthSizes[i].Equal(dex.DefaultSizes[i]) {
+			t.Errorf("defaultDepthSizes[%d] = %s, dex.DefaultSizes[%d] = %s",
+				i, defaultDepthSizes[i], i, dex.DefaultSizes[i])
+		}
+	}
+}
+
+// structural undetermined reasons ----------------------------------------------
+//
+// GHSC is DERIVATIVE — every path runs through NGNC — and KESC is NO-MARKET.
+// Before this coverage existed, every book metric fetched the direct order
+// book for either, got the same empty response an idle-but-real market would
+// return, and reported the same generic "order book is empty" reason either
+// way. These tests pin that the three causes — structural absence,
+// empty-market-but-real, and fetch failure — are told apart. See GitHub issue
+// #105 / docs/backlog.md.
+
+// TestBookMetricsDistinguishNoMarketFromEmptyBook covers the case a naive
+// order-book fetch cannot distinguish on its own: NO-MARKET must be reported
+// as a structural fact, not the market fact an idle-but-real book gets, and
+// it must be reported without ever calling the DEX client — mutate the code
+// to fetch anyway and TestNoMarketNeverFetchesTheBook below catches it.
+func TestBookMetricsDistinguishNoMarketFromEmptyBook(t *testing.T) {
+	poisoned := &dex.Client{HorizonURL: "http://127.0.0.1:1"} // must never be dialed
+
+	subject := Subject{Send: asset.USDC(), Receive: asset.KESC(), Integrity: "NO-MARKET"}
+
+	cases := []struct {
+		name string
+		run  func() MetricResult
+	}{
+		{"spread", func() MetricResult { return RunMetric(ctx(), SpreadMetric{DEX: poisoned}, subject) }},
+		{"concentration", func() MetricResult { return RunMetric(ctx(), ConcentrationMetric{DEX: poisoned}, subject) }},
+		{"depth.observed", func() MetricResult { return RunMetric(ctx(), DepthMetric{DEX: poisoned}, subject) }},
+		{"depth.executable", func() MetricResult {
+			return RunMetric(ctx(), depthExecutable{DepthMetric{DEX: poisoned}}, subject)
+		}},
+		{"price-impact", func() MetricResult { return RunMetric(ctx(), PriceImpactMetric{DEX: poisoned}, subject) }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := tc.run()
+			if r.Determined {
+				t.Fatal("a NO-MARKET corridor must never produce a determined result")
+			}
+			if !strings.Contains(r.Reason, "NO-MARKET") {
+				t.Errorf("reason = %q, want it to name NO-MARKET as a structural fact", r.Reason)
+			}
+			if strings.Contains(r.Reason, "empty") {
+				t.Errorf("reason = %q, reads as a market fact (an empty book) rather than "+
+					"the structural fact this corridor actually has", r.Reason)
+			}
+		})
+	}
+}
+
+// depthExecutable adapts DepthMetric.RunExecutable to the Metric interface
+// so it can go through RunMetric like every other case in the table above.
+type depthExecutable struct{ DepthMetric }
+
+func (m depthExecutable) Describe() Descriptor {
+	return Descriptor{
+		ID: "depth.executable", Scope: ScopeCorridor, Venue: VenuePathfinding,
+		Title:        "executable depth",
+		CanDetermine: "see DepthMetric", CannotDetermine: "see DepthMetric",
+	}
+}
+func (m depthExecutable) Run(ctx context.Context, s Subject) MetricResult {
+	return m.RunExecutable(ctx, s)
+}
+
+// TestBookMetricsDistinguishDerivativeFromEmptyBook covers the other
+// structural case: a DERIVATIVE corridor with no Underlying pair supplied
+// must report the dependency, not a bare empty book. The order-book metrics
+// (spread, concentration, depth.observed) fetch nothing here, because there
+// is nothing to fetch — the whole point of DERIVATIVE. depth.executable and
+// price-impact are pathfinding metrics, not order-book metrics: a DERIVATIVE
+// corridor prices normally through its intermediate asset, so they are
+// exercised separately below rather than asserted structural here.
+func TestBookMetricsDistinguishDerivativeFromEmptyBook(t *testing.T) {
+	poisoned := &dex.Client{HorizonURL: "http://127.0.0.1:1"}
+	subject := Subject{Send: asset.USDC(), Receive: asset.GHSC(), Integrity: "DERIVATIVE"}
+
+	cases := []struct {
+		name string
+		run  func() MetricResult
+	}{
+		{"spread", func() MetricResult { return RunMetric(ctx(), SpreadMetric{DEX: poisoned}, subject) }},
+		{"concentration", func() MetricResult { return RunMetric(ctx(), ConcentrationMetric{DEX: poisoned}, subject) }},
+		{"depth.observed", func() MetricResult { return RunMetric(ctx(), DepthMetric{DEX: poisoned}, subject) }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := tc.run()
+			if r.Determined {
+				t.Fatal("a DERIVATIVE corridor with no underlying pair must never produce a determined result")
+			}
+			if !strings.Contains(r.Reason, "DERIVATIVE") {
+				t.Errorf("reason = %q, want it to name DERIVATIVE as a structural fact", r.Reason)
+			}
+		})
+	}
+}
+
+// TestBookMetricSubstitutesUnderlyingPairExplicitly covers the DERIVATIVE
+// case where the caller does have a legitimate pair to measure instead — the
+// substitution must be a determined result against the underlying book, and
+// it must say so in its evidence, never silently.
+func TestBookMetricSubstitutesUnderlyingPairExplicitly(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "xlm-ngnc-orderbook")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	subject := Subject{
+		Send: asset.Native(), Receive: asset.GHSC(),
+		Integrity: "DERIVATIVE", Underlying: asset.NGNC(),
+	}
+
+	r := RunMetric(ctx(), SpreadMetric{DEX: c}, subject)
+	if !r.Determined {
+		t.Fatalf("substituting a real underlying book should determine a value, got: %s", r.Reason)
+	}
+	if len(r.Evidence) == 0 {
+		t.Fatal("no evidence recorded")
+	}
+	src := r.Evidence[0].Source
+	if !strings.Contains(src, "XLM/NGNC") {
+		t.Errorf("evidence source %q does not name the pair actually measured", src)
+	}
+	if !strings.Contains(src, "substituted") || !strings.Contains(src, "GHSC") {
+		t.Errorf("evidence source %q does not say the substitution happened, or for which "+
+			"corridor — a measurement on a different pair than requested must say so explicitly, "+
+			"never silently", src)
+	}
+}
+
+// TestNoMarketNeverFetchesTheBook is the mutation guard for the "without
+// ever calling the DEX client" claim above: a NO-MARKET subject pointed at
+// an address nothing listens on must still return promptly and
+// undetermined, which is only possible if the structural check runs before
+// any network call.
+func TestNoMarketNeverFetchesTheBook(t *testing.T) {
+	poisoned := &dex.Client{HorizonURL: "http://127.0.0.1:1"}
+	subject := Subject{Send: asset.USDC(), Receive: asset.KESC(), Integrity: "NO-MARKET"}
+
+	start := time.Now()
+	r := RunMetric(ctx(), SpreadMetric{DEX: poisoned}, subject)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("took %s; a structural short-circuit should return immediately, "+
+			"without attempting to dial %s", elapsed, poisoned.HorizonURL)
+	}
+	if r.Determined {
+		t.Fatal("expected an undetermined result")
+	}
+}
+
+// TestDerivativeCorridorPricesNormallyThroughPathfinding pins the other half
+// of the DERIVATIVE distinction: depth.executable and price-impact measure
+// via pathfinding, not an order book, and a DERIVATIVE corridor is exactly
+// the case pathfinding across an intermediate asset succeeds at. Neither
+// metric should ever report GHSC's dependency on NGNC as an obstacle.
+func TestDerivativeCorridorPricesNormallyThroughPathfinding(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	// This subject's Send/Receive do not match the snapshot's real GHSC
+	// corridor — the fixture only records a USDC/NGNC strict-send path —
+	// but the point here is purely that Integrity: DERIVATIVE does not by
+	// itself short-circuit a pathfinding metric the way it does the
+	// order-book metrics above.
+	subject := Subject{Send: asset.USDC(), Receive: asset.NGNC(), Integrity: "DERIVATIVE"}
+
+	depth := DepthMetric{DEX: c, Sizes: []decimal.Decimal{decimal.NewFromInt(1), decimal.NewFromInt(100)}}
+	if r := depth.RunExecutable(ctx(), subject); !r.Determined {
+		t.Errorf("depth.executable on a DERIVATIVE corridor should still price via "+
+			"pathfinding, got undetermined: %s", r.Reason)
+	}
+
+	impact := PriceImpactMetric{DEX: c, ProbeSize: decimal.NewFromInt(1), FullSize: decimal.NewFromInt(100)}
+	if r := RunMetric(ctx(), impact, subject); !r.Determined {
+		t.Errorf("price-impact on a DERIVATIVE corridor should still price via "+
+			"pathfinding, got undetermined: %s", r.Reason)
+	}
+}
+
+// concentration metric ------------------------------------------------------------
+//
+// GitHub issue #106: concentration.liquidity had no dedicated coverage at
+// all before this section.
+
+func TestConcentrationMetricFromRecordedBook(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "xlm-ngnc-orderbook")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	r := RunMetric(ctx(), ConcentrationMetric{DEX: c}, Subject{Send: asset.Native(), Receive: asset.NGNC()})
+
+	if !r.Determined {
+		t.Fatalf("concentration metric undetermined: %s", r.Reason)
+	}
+	if r.Unit != UnitRatio {
+		t.Errorf("unit = %s, want ratio", r.Unit)
+	}
+	if !r.Value.IsPositive() || r.Value.GreaterThan(decimal.NewFromInt(1)) {
+		t.Errorf("HHI = %s, want a value in (0, 1]", r.Value)
+	}
+	if len(r.Evidence) == 0 {
+		t.Error("no evidence recorded")
+	}
+}
+
+func TestConcentrationMetricEmptyBook(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "xlm-ngnc-orderbook-empty")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	r := RunMetric(ctx(), ConcentrationMetric{DEX: c}, Subject{Send: asset.Native(), Receive: asset.NGNC()})
+
+	if r.Determined {
+		t.Error("empty book must produce an undetermined result, not an HHI of zero")
+	}
+	if !strings.Contains(r.Reason, "empty") {
+		t.Errorf("reason = %q, want it to name the empty book", r.Reason)
+	}
+}
+
+func TestConcentrationMetricNilDEX(t *testing.T) {
+	r := RunMetric(ctx(), ConcentrationMetric{}, Subject{Send: asset.Native(), Receive: asset.NGNC()})
+	if r.Determined {
+		t.Error("nil DEX client must produce an undetermined result")
+	}
+}
+
+func TestConcentrationMetricDescriptorIsValid(t *testing.T) {
+	d := ConcentrationMetric{}.Describe()
+	if err := d.Validate(); err != nil {
+		t.Errorf("concentration metric descriptor: %v", err)
+	}
+}
+
+// price impact metric ------------------------------------------------------------
+//
+// GitHub issue #106: price-impact.size had no fixture-backed coverage at
+// all before this section — the existing usdc-ngnc-strictsend snapshot
+// already records both a probe (1 USDC) and a full (100 USDC) strict-send
+// response, which is exactly the shape this metric needs and nothing new
+// had to be captured to exercise it.
+
+func TestPriceImpactMetricFromRecordedPaths(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{
+		DEX:       c,
+		ProbeSize: decimal.NewFromInt(1),
+		FullSize:  decimal.NewFromInt(100),
+	}
+	r := RunMetric(ctx(), impact, Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+
+	if !r.Determined {
+		t.Fatalf("price impact metric undetermined: %s", r.Reason)
+	}
+	if r.Unit != UnitPercent {
+		t.Errorf("unit = %s, want percent", r.Unit)
+	}
+	if r.Value.IsNegative() {
+		t.Errorf("impact = %s, must never be reported negative (see the clamp in Run)", r.Value)
+	}
+	if len(r.Evidence) == 0 {
+		t.Error("no evidence recorded")
+	}
+	if r.Summary == "" {
+		t.Error("summary is empty")
+	}
+}
+
+func TestPriceImpactMetricNoPathAtProbeSize(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend-empty")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{DEX: c, ProbeSize: decimal.NewFromInt(1), FullSize: decimal.NewFromInt(100)}
+	r := RunMetric(ctx(), impact, Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+
+	if r.Determined {
+		t.Error("no path at either size must produce an undetermined result")
+	}
+}
+
+func TestPriceImpactMetricNilDEX(t *testing.T) {
+	impact := PriceImpactMetric{}
+	r := RunMetric(ctx(), impact, Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+	if r.Determined {
+		t.Error("nil DEX client must produce an undetermined result")
+	}
+}
+
+func TestPriceImpactMetricDescriptorIsValid(t *testing.T) {
+	d := PriceImpactMetric{}.Describe()
+	if err := d.Validate(); err != nil {
+		t.Errorf("price impact metric descriptor: %v", err)
+	}
+}
+
+// TestPriceImpactMetricMalfunctionReferenceIsUndetermined guards issue #161:
+// when the reference cross-check is MALFUNCTION, no derived quantity may be
+// computed because the benchmark itself is suspect. Price impact is one such
+// derived quantity — a precise-looking percentage would misrepresent a
+// measurement that cannot be validated.
+func TestPriceImpactMetricMalfunctionReferenceIsUndetermined(t *testing.T) {
+	poisoned := &dex.Client{HorizonURL: "http://127.0.0.1:1"} // must never be dialed
+
+	subject := Subject{
+		Send:               asset.USDC(),
+		Receive:            asset.NGNC(),
+		ReferenceAgreement: "MALFUNCTION",
+	}
+
+	impact := PriceImpactMetric{
+		DEX:       poisoned,
+		ProbeSize: decimal.NewFromInt(1),
+		FullSize:  decimal.NewFromInt(100),
+	}
+	r := RunMetric(ctx(), impact, subject)
+
+	if r.Determined {
+		t.Error("a MALFUNCTION reference must not produce a determined price impact")
+	}
+	if !strings.Contains(r.Reason, "MALFUNCTION") {
+		t.Errorf("reason = %q, want it to name MALFUNCTION as the cause", r.Reason)
+	}
+	if !strings.Contains(r.Reason, "unscorable") {
+		t.Errorf("reason = %q, want it to name the unscorable reference", r.Reason)
+	}
+}
+
+// TestPriceImpactMetricMalfunctionShortCircuitsBeforeNetwork guards that the
+// MALFUNCTION check runs before any network call. The poisoned client above
+// must never be dialed — this test would hang or fail if the guard were
+// placed after the pathfinding calls.
+func TestPriceImpactMetricMalfunctionShortCircuitsBeforeNetwork(t *testing.T) {
+	poisoned := &dex.Client{HorizonURL: "http://127.0.0.1:1"}
+
+	subject := Subject{
+		Send:               asset.USDC(),
+		Receive:            asset.NGNC(),
+		ReferenceAgreement: "MALFUNCTION",
+	}
+
+	start := time.Now()
+	r := RunMetric(ctx(), PriceImpactMetric{DEX: poisoned}, subject)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("took %s; a MALFUNCTION short-circuit should return immediately, "+
+			"without attempting to dial %s", elapsed, poisoned.HorizonURL)
+	}
+	if r.Determined {
+		t.Fatal("expected an undetermined result")
+	}
+}
+
+// TestPriceImpactMetricEmptyReferenceAgreementProceeds pins that an empty
+// (unknown) ReferenceAgreement does not suppress the metric. Absent
+// information is not evidence of malfunction — the metric proceeds when the
+// caller has not supplied a reference agreement state.
+func TestPriceImpactMetricEmptyReferenceAgreementProceeds(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{
+		DEX: c,
+		Sizes: []decimal.Decimal{
+			decimal.NewFromInt(1),
+			decimal.NewFromInt(100),
+		},
+	}
+
+	// Empty ReferenceAgreement — the caller did not supply one.
+	r := RunMetric(ctx(), impact, Subject{
+		Send:    asset.USDC(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("price impact with empty ReferenceAgreement should still determine, got: %s", r.Reason)
+	}
+}
+
+// price impact curve -----------------------------------------------------------
+//
+// GitHub issue #159: PriceImpactMetric should report the full curve shape
+// across multiple sizes, not just a single degradation figure.
+
+func TestPriceImpactCurveFromRecordedPaths(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend-curve")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{
+		DEX: c,
+		Sizes: []decimal.Decimal{
+			decimal.NewFromInt(1),
+			decimal.NewFromInt(10),
+			decimal.NewFromInt(100),
+			decimal.NewFromInt(1000),
+			decimal.NewFromInt(5000),
+		},
+	}
+	curve, r := impact.RunCurve(ctx(), Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+
+	if !r.Determined {
+		t.Fatalf("price impact curve undetermined: %s", r.Reason)
+	}
+	if curve == nil {
+		t.Fatal("RunCurve returned nil curve for a determined result")
+	}
+	if r.Unit != UnitPercent {
+		t.Errorf("unit = %s, want percent", r.Unit)
+	}
+	if r.Value.IsNegative() {
+		t.Errorf("max impact = %s, must never be negative", r.Value)
+	}
+
+	// The curve should have 5 points (all 5 sizes found paths).
+	if got := len(curve.Points); got != 5 {
+		t.Fatalf("curve points = %d, want 5", got)
+	}
+
+	// The reference rate should be the rate at the smallest size.
+	if curve.ReferenceRate.IsZero() {
+		t.Error("reference rate must not be zero")
+	}
+
+	// The first point (smallest size) should have zero impact.
+	if !curve.Points[0].ImpactPct.IsZero() {
+		t.Errorf("first point impact = %s, want 0 (reference point)", curve.Points[0].ImpactPct)
+	}
+
+	// Impact should be non-decreasing (later sizes degrade at least as
+	// much as earlier ones — the fixture is monotonic).
+	var prevImpact decimal.Decimal
+	for i, p := range curve.Points {
+		if p.ImpactPct.LessThan(prevImpact) {
+			t.Errorf("point %d impact %s < previous %s, curve is not monotonic",
+				i, p.ImpactPct, prevImpact)
+		}
+		prevImpact = p.ImpactPct
+	}
+
+	// The last point should have positive impact (the fixture degrades).
+	if curve.Points[len(curve.Points)-1].ImpactPct.IsZero() {
+		t.Error("last point has zero impact; the fixture should show degradation")
+	}
+
+	// Evidence should contain each point.
+	if len(r.Evidence) == 0 {
+		t.Error("no evidence recorded")
+	}
+	for _, p := range curve.Points {
+		if !strings.Contains(r.Evidence[0].Observed, "size="+p.Size.StringFixed(1)) {
+			t.Errorf("evidence does not mention size %s", p.Size)
+		}
+	}
+
+	if r.Summary == "" {
+		t.Error("summary is empty")
+	}
+}
+
+func TestPriceImpactCurveBackwardCompatibleProbeFull(t *testing.T) {
+	// When only ProbeSize and FullSize are set (no Sizes), the metric
+	// should behave exactly as before — a two-point comparison.
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{
+		DEX:       c,
+		ProbeSize: decimal.NewFromInt(1),
+		FullSize:  decimal.NewFromInt(100),
+	}
+
+	// Empty ReferenceAgreement — the caller did not supply one.
+	r := RunMetric(ctx(), impact, Subject{
+		Send:    asset.USDC(),
+		Receive: asset.NGNC(),
+	})
+
+	if !r.Determined {
+		t.Fatalf("price impact with empty ReferenceAgreement should still determine, got: %s", r.Reason)
+	}
+}
+
+// TestPriceImpactMetricScorableReferenceAgreementsProceeds pins that
+// non-MALFUNCTION agreement states (AGREE, DISAGREE, SINGLE, STALE) do not
+// suppress the metric. Only MALFUNCTION does.
+func TestPriceImpactMetricScorableReferenceAgreementsProceeds(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{
+		DEX: c,
+		Sizes: []decimal.Decimal{
+			decimal.NewFromInt(1),
+			decimal.NewFromInt(100),
+		},
+	}
+
+	for _, agree := range []string{"AGREE", "DISAGREE", "SINGLE", "STALE"} {
+		r := RunMetric(ctx(), impact, Subject{
+			Send:               asset.USDC(),
+			Receive:            asset.NGNC(),
+			ReferenceAgreement: agree,
+		})
+		if !r.Determined {
+			t.Errorf("ReferenceAgreement=%s should not suppress price impact, got undetermined: %s",
+				agree, r.Reason)
+		}
+	}
+}
+
+func TestPriceImpactCurveFlatWhenRatesIdentical(t *testing.T) {
+	// The usdc-ngnc-strictsend snapshot returns the same body for both
+	// sizes → the curve should be flat (zero impact at every point).
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{
+		DEX: c,
+		Sizes: []decimal.Decimal{
+			decimal.NewFromInt(1),
+			decimal.NewFromInt(100),
+		},
+	}
+
+	curve, r := impact.RunCurve(ctx(), Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+
+	if !r.Determined {
+		t.Fatalf("price impact undetermined: %s", r.Reason)
+	}
+	if curve == nil {
+		t.Fatal("RunCurve returned nil curve for a determined result")
+	}
+	if got := len(curve.Points); got != 2 {
+		t.Fatalf("curve points = %d, want 2 (probe + full)", got)
+	}
+	// Both points use the same fixture → same rate → zero impact.
+	if !curve.Points[1].ImpactPct.IsZero() {
+		t.Errorf("impact = %s, want 0 when both sizes return the same rate",
+			curve.Points[1].ImpactPct)
+	}
+}
+
+func TestPriceImpactCurveReportsImprovingRates(t *testing.T) {
+	// The second size deliberately has a better rate than the reference. The
+	// metric must preserve that observation as a negative impact rather than
+	// flattening it to zero and making the curve appear monotonic.
+	bodies := map[string]string{
+		"1":   "100",
+		"10":  "1100",
+		"100": "9000",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		destination, ok := bodies[r.URL.Query().Get("source_amount")]
+		if !ok {
+			http.Error(w, "unrecorded size", http.StatusNotFound)
+			return
+		}
+		fmt.Fprintf(w, `{"_embedded":{"records":[{
+      "source_asset_type":"credit_alphanum4","source_asset_code":"USDC",
+      "source_amount":%q,
+      "destination_asset_type":"credit_alphanum4","destination_asset_code":"NGNC",
+      "destination_amount":%q,"path":[]}]}}`, r.URL.Query().Get("source_amount"), destination)
+	}))
+	defer srv.Close()
+
+	impact := PriceImpactMetric{
+		DEX:   &dex.Client{HorizonURL: srv.URL},
+		Sizes: []decimal.Decimal{decimal.NewFromInt(1), decimal.NewFromInt(10), decimal.NewFromInt(100)},
+	}
+	curve, result := impact.RunCurve(ctx(), Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+	if !result.Determined {
+		t.Fatalf("improving curve was undetermined: %s", result.Reason)
+	}
+	if curve == nil {
+		t.Fatal("RunCurve returned no curve for a determined result")
+	}
+	if got, want := curve.Points[1].ImpactPct.StringFixed(2), "-10.00"; got != want {
+		t.Errorf("improving point impact = %s, want %s", got, want)
+	}
+	if !strings.Contains(result.Evidence[0].Observed, "impact=-10.0000%") {
+		t.Errorf("evidence = %q, want the improving point to remain reportable", result.Evidence[0].Observed)
+	}
+}
+
+func TestPriceImpactCurveAllSizesFail(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend-empty")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{
+		DEX:   c,
+		Sizes: []decimal.Decimal{decimal.NewFromInt(1), decimal.NewFromInt(100)},
+	}
+	curve, r := impact.RunCurve(ctx(), Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+
+	if r.Determined {
+		t.Error("all sizes failing must produce an undetermined result")
+	}
+	if curve != nil {
+		t.Error("all sizes failing must return a nil curve")
+	}
+}
+
+func TestPriceImpactCurveNilDEX(t *testing.T) {
+	impact := PriceImpactMetric{}
+	curve, r := impact.RunCurve(ctx(), Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+	if r.Determined {
+		t.Error("nil DEX client must produce an undetermined result")
+	}
+	if curve != nil {
+		t.Error("nil DEX must return a nil curve")
+	}
+}
+
+func TestPriceImpactCurveEmptySubject(t *testing.T) {
+	impact := PriceImpactMetric{DEX: &dex.Client{HorizonURL: "http://example.invalid"}}
+	curve, r := impact.RunCurve(ctx(), Subject{})
+	if r.Determined {
+		t.Error("empty subject must produce an undetermined result")
+	}
+	if curve != nil {
+		t.Error("empty subject must return a nil curve")
+	}
+}
+
+func TestPriceImpactCurveNoMarket(t *testing.T) {
+	poisoned := &dex.Client{HorizonURL: "http://127.0.0.1:1"}
+	impact := PriceImpactMetric{DEX: poisoned}
+	curve, r := impact.RunCurve(ctx(), Subject{
+		Send: asset.USDC(), Receive: asset.KESC(), Integrity: "NO-MARKET",
+	})
+	if r.Determined {
+		t.Error("NO-MARKET corridor must not produce a determined result")
+	}
+	if curve != nil {
+		t.Error("NO-MARKET must return a nil curve")
+	}
+	if !strings.Contains(r.Reason, "NO-MARKET") {
+		t.Errorf("reason = %q, want it to name NO-MARKET", r.Reason)
+	}
+}
+
+func TestPriceImpactCurveRunMatchesRunCurve(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "usdc-ngnc-strictsend-curve")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	impact := PriceImpactMetric{
+		DEX: c,
+		Sizes: []decimal.Decimal{
+			decimal.NewFromInt(1),
+			decimal.NewFromInt(100),
+		},
+	}
+
+	runResult := RunMetric(ctx(), impact, Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+	curve, curveResult := impact.RunCurve(ctx(), Subject{Send: asset.USDC(), Receive: asset.NGNC()})
+
+	if runResult.Determined != curveResult.Determined {
+		t.Errorf("Run determined=%v, RunCurve determined=%v", runResult.Determined, curveResult.Determined)
+	}
+	if runResult.Value.Equal(curveResult.Value) {
+		// Values should match.
+	} else {
+		t.Errorf("Run value=%s, RunCurve value=%s", runResult.Value, curveResult.Value)
+	}
+	if curve == nil && runResult.Determined {
+		t.Error("RunCurve returned nil curve but Run was determined")
+	}
+}
+
+func TestPriceImpactCurveDescriptorIsValid(t *testing.T) {
+	d := PriceImpactMetric{}.Describe()
+	if err := d.Validate(); err != nil {
+		t.Errorf("price impact curve descriptor: %v", err)
+	}
+}
+
+// deviation metric --------------------------------------------------------------
+//
+// See GitHub issue #103: the gap between the direct book's implied mid and
+// the independent reference mid, as a metric separate from route loss.
+
+func TestDeviationMetricFromRecordedBook(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "xlm-ngnc-orderbook")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	dev := DeviationMetric{
+		DEX: c,
+		Reference: refrate.Rate{
+			Base: "USD", Quote: "NGN",
+			Mid:    decimal.RequireFromString("1350.2568"),
+			Source: "exchangerate-api",
+			AsOf:   time.Now().UTC(),
+		},
+	}
+	r := RunMetric(ctx(), dev, Subject{Send: asset.Native(), Receive: asset.NGNC()})
+
+	if !r.Determined {
+		t.Fatalf("deviation metric undetermined: %s", r.Reason)
+	}
+	if r.Unit != UnitPercent {
+		t.Errorf("unit = %s, want percent", r.Unit)
+	}
+	if len(r.Evidence) != 2 {
+		t.Fatalf("evidence entries = %d, want 2 (book and reference)", len(r.Evidence))
+	}
+	for _, e := range r.Evidence {
+		if e.Source == "" || e.Observed == "" {
+			t.Errorf("evidence %+v is missing a source or an observation", e)
+		}
+	}
+	if r.Summary == "" {
+		t.Error("summary is empty")
+	}
+}
+
+func TestDeviationMetricSignReflectsDirection(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "xlm-ngnc-orderbook")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+	subject := Subject{Send: asset.Native(), Receive: asset.NGNC()}
+
+	// The book mid does not move between these two runs; only the reference
+	// does. A reference far below the book mid must deviate positive, and
+	// one far above must deviate negative — otherwise the sign is backwards
+	// or the arithmetic has been mangled.
+	low := RunMetric(ctx(), DeviationMetric{DEX: c, Reference: refrate.Rate{
+		Base: "USD", Quote: "NGN", Mid: decimal.RequireFromString("1"), Source: "static", AsOf: time.Now().UTC(),
+	}}, subject)
+	high := RunMetric(ctx(), DeviationMetric{DEX: c, Reference: refrate.Rate{
+		Base: "USD", Quote: "NGN", Mid: decimal.RequireFromString("100000000"), Source: "static", AsOf: time.Now().UTC(),
+	}}, subject)
+
+	if !low.Determined || !high.Determined {
+		t.Fatalf("expected both determined, got low.Determined=%v (%s) high.Determined=%v (%s)",
+			low.Determined, low.Reason, high.Determined, high.Reason)
+	}
+	if !low.Value.IsPositive() {
+		t.Errorf("a reference far below the book mid should deviate positive, got %s", low.Value)
+	}
+	if !high.Value.IsNegative() {
+		t.Errorf("a reference far above the book mid should deviate negative, got %s", high.Value)
+	}
+}
+
+func TestDeviationMetricEmptyBook(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "xlm-ngnc-orderbook-empty")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	dev := DeviationMetric{
+		DEX: c,
+		Reference: refrate.Rate{
+			Base: "USD", Quote: "NGN", Mid: decimal.RequireFromString("1350.2568"), Source: "exchangerate-api",
+		},
+	}
+	r := RunMetric(ctx(), dev, Subject{Send: asset.Native(), Receive: asset.NGNC()})
+
+	if r.Determined {
+		t.Error("empty book must produce an undetermined result, not a zero deviation")
+	}
+	if !strings.Contains(r.Reason, "empty") {
+		t.Errorf("reason = %q, want it to name the empty book", r.Reason)
+	}
+}
+
+func TestDeviationMetricOneSidedBook(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "xlm-ngnc-orderbook-onesided")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	dev := DeviationMetric{
+		DEX: c,
+		Reference: refrate.Rate{
+			Base: "USD", Quote: "NGN", Mid: decimal.RequireFromString("1350.2568"), Source: "exchangerate-api",
+		},
+	}
+	r := RunMetric(ctx(), dev, Subject{Send: asset.Native(), Receive: asset.NGNC()})
+
+	if r.Determined {
+		t.Error("one-sided book must produce an undetermined result")
+	}
+	if !strings.Contains(r.Reason, "nobody is buying") {
+		t.Errorf("reason = %q, want it to name the missing side", r.Reason)
+	}
+}
+
+func TestDeviationMetricNoDirectPair(t *testing.T) {
+	// GHSC: DERIVATIVE, no Underlying supplied — never even attempts a fetch.
+	dev := DeviationMetric{
+		DEX: &dex.Client{HorizonURL: "http://127.0.0.1:1"},
+		Reference: refrate.Rate{
+			Base: "USD", Quote: "GHS", Mid: decimal.RequireFromString("11.09"), Source: "exchangerate-api",
+		},
+	}
+	r := RunMetric(ctx(), dev, Subject{Send: asset.USDC(), Receive: asset.GHSC(), Integrity: "DERIVATIVE"})
+
+	if r.Determined {
+		t.Error("a DERIVATIVE corridor with no underlying pair must not produce a determined result")
+	}
+	if !strings.Contains(r.Reason, "DERIVATIVE") {
+		t.Errorf("reason = %q, want it to name DERIVATIVE as a structural fact", r.Reason)
+	}
+}
+
+func TestDeviationMetricUnscorableReference(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "xlm-ngnc-orderbook")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	dev := DeviationMetric{
+		DEX: c,
+		Reference: refrate.Rate{
+			Base: "USD", Quote: "NGN",
+			Mid:       decimal.RequireFromString("1350.2568"),
+			Source:    "exchangerate-api",
+			Agreement: refrate.AgreementMalfunction,
+			Note:      "providers differ by 400%, further apart than either can be trusted",
+		},
+	}
+	r := RunMetric(ctx(), dev, Subject{Send: asset.Native(), Receive: asset.NGNC()})
+
+	if r.Determined {
+		t.Error("an unscorable reference must not produce a determined result")
+	}
+	if !strings.Contains(r.Reason, "cross-check") {
+		t.Errorf("reason = %q, want it to name the cross-check as the cause", r.Reason)
+	}
+}
+
+func TestDeviationMetricNoReference(t *testing.T) {
+	m := loadOrderBookSnapshot(t, "xlm-ngnc-orderbook")
+	c := &dex.Client{HorizonURL: "https://horizon.stellar.org", HTTPClient: m.HTTPClient()}
+
+	dev := DeviationMetric{DEX: c, ReferenceUnavailable: "exchangerate-api: rate limited"}
+	r := RunMetric(ctx(), dev, Subject{Send: asset.Native(), Receive: asset.NGNC()})
+
+	if r.Determined {
+		t.Error("no reference rate must not produce a determined result")
+	}
+	if !strings.Contains(r.Reason, "rate limited") {
+		t.Errorf("reason = %q, want it to carry the caller's unavailability reason", r.Reason)
+	}
+}
+
+func TestDeviationMetricNilDEX(t *testing.T) {
+	dev := DeviationMetric{Reference: refrate.Rate{
+		Base: "USD", Quote: "NGN", Mid: decimal.RequireFromString("1350"), Source: "static",
+	}}
+	r := RunMetric(ctx(), dev, Subject{Send: asset.Native(), Receive: asset.NGNC()})
+	if r.Determined {
+		t.Error("nil DEX client must produce an undetermined result")
+	}
+}
+
+func TestDeviationMetricDescriptorIsValid(t *testing.T) {
+	d := DeviationMetric{}.Describe()
+	if err := d.Validate(); err != nil {
+		t.Errorf("deviation metric descriptor: %v", err)
 	}
 }
 
@@ -1070,5 +2230,125 @@ func TestRunMetricValidEvidence(t *testing.T) {
 	r := RunMetric(ctx(), evidenceValid{}, Subject{})
 	if !r.Determined {
 		t.Errorf("valid evidence should produce a determined result, got reason: %s", r.Reason)
+	}
+}
+
+type recordedResponse struct {
+	status int
+	body   string
+	err    error
+}
+
+type recordedTransport map[string]recordedResponse
+
+func (t recordedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r, ok := t[req.Method+" "+req.URL.String()]
+	if !ok {
+		return nil, fmt.Errorf("unrecorded request: %s %s", req.Method, req.URL)
+	}
+	if r.err != nil {
+		return nil, r.err
+	}
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return &http.Response{
+		StatusCode: r.status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(r.body)),
+		Request:    req,
+	}, nil
+}
+
+func TestHomeDomainRoundTrip(t *testing.T) {
+	const (
+		issuer = "GISSUER"
+		code   = "TOK"
+		domain = "issuer.example"
+	)
+	accountURL := "https://horizon.example/accounts/" + issuer
+	tomlURL := anchor.TOMLURL(domain)
+
+	cases := []struct {
+		name       string
+		account    string
+		toml       string
+		tomlStatus int
+		err        error
+		determined bool
+		passed     bool
+		contains   string
+	}{
+		{
+			name:       "matching account and document",
+			account:    `{"home_domain":"` + domain + `"}`,
+			toml:       `[[CURRENCIES]]` + "\ncode=\"" + code + "\"\nissuer=\"" + issuer + "\"\n",
+			determined: true, passed: true, contains: "both identify",
+		},
+		{
+			name:       "document lists code for another issuer",
+			account:    `{"home_domain":"` + domain + `"}`,
+			toml:       `[[CURRENCIES]]` + "\ncode=\"" + code + "\"\nissuer=\"GOTHER\"\n",
+			determined: true, passed: false, contains: "no [[CURRENCIES]] entry matching both code and issuer",
+		},
+		{
+			name:       "account declares no home domain",
+			account:    `{}`,
+			determined: false, contains: "declares no home_domain",
+		},
+		{
+			name:       "Horizon is unavailable",
+			err:        fmt.Errorf("offline"),
+			determined: false, contains: "Horizon was unreachable",
+		},
+		{
+			name:       "stellar toml is unavailable",
+			account:    `{"home_domain":"` + domain + `"}`,
+			tomlStatus: http.StatusNotFound,
+			determined: false, contains: "document could not be fetched",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			responses := recordedTransport{}
+			if tc.err != nil {
+				responses[http.MethodGet+" "+accountURL] = recordedResponse{err: tc.err}
+			} else {
+				responses[http.MethodGet+" "+accountURL] = recordedResponse{body: tc.account}
+			}
+			if tc.toml != "" || tc.tomlStatus != 0 {
+				responses[http.MethodGet+" "+tomlURL] = recordedResponse{status: tc.tomlStatus, body: tc.toml}
+			}
+
+			check := HomeDomainRoundTrip{
+				HorizonURL: "https://horizon.example",
+				HTTPClient: &http.Client{Transport: responses},
+			}
+			r := Run(ctx(), check, Subject{Asset: asset.Stellar(code, issuer)})
+			if r.Determined != tc.determined {
+				t.Fatalf("Determined = %v, want %v: %s", r.Determined, tc.determined, r.Summary)
+			}
+			if tc.determined && r.Passed != tc.passed {
+				t.Errorf("Passed = %v, want %v: %s", r.Passed, tc.passed, r.Summary)
+			}
+			if !strings.Contains(r.Summary+" "+r.Reason, tc.contains) {
+				t.Errorf("result %q does not mention %q", r.Summary+" "+r.Reason, tc.contains)
+			}
+			if len(r.Evidence) == 0 {
+				t.Error("result must record account evidence")
+			}
+			if tc.determined && len(r.Evidence) != 2 {
+				t.Fatalf("determined result has %d evidence entries, want account and document", len(r.Evidence))
+			}
+			if tc.determined {
+				if !strings.Contains(r.Evidence[0].Source, "/accounts/"+issuer) {
+					t.Errorf("account evidence source = %q, want issuer account", r.Evidence[0].Source)
+				}
+				if !strings.Contains(r.Evidence[1].Source, tomlURL) {
+					t.Errorf("document evidence source = %q, want %s", r.Evidence[1].Source, tomlURL)
+				}
+			}
+		})
 	}
 }

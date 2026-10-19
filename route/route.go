@@ -192,6 +192,16 @@ type Quote struct {
 	Description string // e.g. "USDC -> XLM -> NGNC"
 	Source      string // anchor domain, or "stellar-dex"
 
+	// Hops are the intermediate assets the priced path routes through, in
+	// execution order, between SendAsset and ReceiveAsset. Empty means a
+	// direct market — the same fact dex.Path.Hops records, carried onto
+	// the quote because Description cannot carry it: the arrow-joined
+	// string is display text, and an asset code identifies nothing
+	// without its issuer. The full path in execution order is SendAsset,
+	// then Hops, then ReceiveAsset; QuoteJSON.Hops publishes exactly that
+	// sequence (backlog #84, issue #100).
+	Hops []asset.Asset
+
 	SendAsset     asset.Asset
 	SendAmount    decimal.Decimal
 	ReceiveAsset  asset.Asset
@@ -216,6 +226,12 @@ type Quote struct {
 	LossAmount decimal.Decimal
 
 	Verdict Verdict
+
+	// PathCount is the number of distinct routes Horizon returned for this
+	// size. The value is published alongside the selected quote so a client
+	// can tell whether a route was unique or part of a fragmented market,
+	// without re-deriving it from the raw Horizon response.
+	PathCount int
 
 	// Warnings are conditions the user must see before acting.
 	Warnings []string
@@ -289,6 +305,15 @@ type Result struct {
 	// engine having to flatten that into prose.
 	Reference refrate.Rate
 
+	// Parallel is the parallel/street-market reference, reported alongside
+	// the official one and never blended into it. It is nil when the engine
+	// has no parallel source configured at all — absent rather than
+	// UNABLE-TO-DETERMINE, since a corridor that was never asked the question
+	// is a different state from one whose source failed. When non-nil it is
+	// REPORTED with a gap, or UNABLE-TO-DETERMINE with a reason. The official
+	// verdict and every loss figure are scored without reference to it.
+	Parallel *refrate.Parallel
+
 	// Integrity is the corridor's structural state, independent of pricing.
 	// A caller that reports only Quotes and Recommended will silently
 	// misrepresent a no-market or derivative corridor.
@@ -310,12 +335,21 @@ type Engine struct {
 	DEX     *dex.Client
 	RefRate refrate.Provider
 
+	// Parallel is an optional parallel/street-market rate source, reported as
+	// a second reference dimension alongside RefRate. It never feeds a
+	// verdict: the official rate remains the only thing routes are scored
+	// against. Nil leaves the parallel dimension off the result entirely.
+	Parallel refrate.Provider
+
 	// ProbeAmount sizes the slippage probe. Defaults to 10 send units.
 	ProbeAmount decimal.Decimal
 }
 
 // Quote prices every available route for the request and ranks them.
 func (e *Engine) Quote(ctx context.Context, req Request) (*Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if e.RefRate == nil {
 		return nil, fmt.Errorf("route: a reference rate provider is required; " +
 			"without one the engine can rank routes but cannot tell a good one from a bad one")
@@ -327,6 +361,9 @@ func (e *Engine) Quote(ctx context.Context, req Request) (*Result, error) {
 	ref, err := e.RefRate.Rate(ctx, req.ReferenceBase, req.ReferenceQuote)
 	if err != nil {
 		return nil, fmt.Errorf("route: reference rate unavailable: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// A benchmark the providers cannot agree on is not a benchmark. Scoring
@@ -345,6 +382,10 @@ func (e *Engine) Quote(ctx context.Context, req Request) (*Result, error) {
 		ReferenceAsOf:   ref.AsOf,
 		Reference:       ref,
 	}
+	if e.Parallel != nil {
+		p := refrate.ParallelAgainst(ctx, e.Parallel, ref)
+		res.Parallel = &p
+	}
 
 	if e.DEX != nil {
 		d, err := e.quoteDEX(ctx, req, ref)
@@ -354,6 +395,7 @@ func (e *Engine) Quote(ctx context.Context, req Request) (*Result, error) {
 		default:
 			res.Integrity = d.integrity
 			res.DependsOn = d.dependsOn
+			res.Notes = append(res.Notes, unknownHopNote(d.unknownHops)...)
 			if d.quote != nil {
 				res.Quotes = append(res.Quotes, *d.quote)
 			}
@@ -415,11 +457,16 @@ func (e *Engine) unscored(ctx context.Context, req Request, ref refrate.Rate) (*
 		ReferenceAsOf:   ref.AsOf,
 		Reference:       ref,
 	}
+	if e.Parallel != nil {
+		p := refrate.ParallelAgainst(ctx, e.Parallel, ref)
+		res.Parallel = &p
+	}
 
 	if e.DEX != nil {
 		if d, err := e.quoteDEX(ctx, req, ref); err == nil {
 			res.Integrity = d.integrity
 			res.DependsOn = d.dependsOn
+			res.Notes = append(res.Notes, unknownHopNote(d.unknownHops)...)
 			if d.quote != nil {
 				// Carried for its route description and receive amount;
 				// score() left the verdict Unknown because the mid is not
@@ -450,6 +497,12 @@ type dexResult struct {
 	quote     *Quote
 	integrity Integrity
 	dependsOn []asset.Asset
+
+	// unknownHops are the intermediate assets pathfinding routed through
+	// that are neither native XLM nor registered in the asset registry. They
+	// are carried so the caller can publish the coverage gap (see
+	// unknownHopNote); they never influence the classification itself.
+	unknownHops []asset.Asset
 }
 
 // describeAssets renders a list of assets for a human-readable note.
@@ -464,17 +517,55 @@ func describeAssets(as []asset.Asset) string {
 	return strings.Join(codes, " and ")
 }
 
+// unknownHopNote renders the coverage finding for hops pathfinding routed
+// through that the asset registry does not know. An empty list produces no
+// note.
+//
+// The note exists because the classification treats an unregistered hop as
+// evidence of an independent market — the documented false-negative in
+// asset/known.go — and that decision must be visible wherever a corridor is
+// reported, not buried in the registry.
+func unknownHopNote(unknown []asset.Asset) []string {
+	if len(unknown) == 0 {
+		return nil
+	}
+	names := make([]string, len(unknown))
+	for i, a := range unknown {
+		names[i] = a.String()
+	}
+	return []string{fmt.Sprintf(
+		"Unregistered hop asset(s) %s appeared in pathfinding and are not in the "+
+			"asset registry. An unrecognised hop is currently treated as having an "+
+			"independent market; see asset/known.go for the bounded false-negative.",
+		strings.Join(names, ", "))}
+}
+
 // classify determines corridor integrity from the complete set of paths.
 //
 // The claim "reachable only through another fiat token" is about every path,
 // not the best one, so this examines all of them: a single path that avoids
 // fiat intermediaries is enough to prove an independent market exists.
-func classify(paths []dex.Path, dest asset.Asset) (Integrity, []asset.Asset) {
+//
+// The third return value is the set of hop assets that are neither native
+// XLM nor registered — the coverage gap. It never affects the integrity
+// classification: an unknown hop is treated exactly like a bridge hop, which
+// is the known, bounded false-negative documented in asset/known.go. It is
+// returned so the caller can surface it rather than let it stay silent.
+func distinctPathCount(paths []dex.Path) int {
+	seen := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		seen[p.Describe()] = struct{}{}
+	}
+	return len(seen)
+}
+
+func classify(paths []dex.Path, dest asset.Asset) (Integrity, []asset.Asset, []asset.Asset) {
 	if len(paths) == 0 {
-		return IntegrityNoMarket, nil
+		return IntegrityNoMarket, nil, nil
 	}
 
 	seen := map[string]asset.Asset{}
+	unknown := map[string]asset.Asset{}
 	independent := false
 
 	for _, p := range paths {
@@ -484,9 +575,18 @@ func classify(paths []dex.Path, dest asset.Asset) (Integrity, []asset.Asset) {
 			if h.Code == dest.Code && h.Issuer == dest.Issuer {
 				continue
 			}
-			if asset.IsFiatToken(h) {
+			switch asset.ClassifyHop(h) {
+			case asset.HopFiat:
 				fiatHops++
 				seen[h.Code+":"+h.Issuer] = h
+			case asset.HopBridge:
+				// Native XLM, or a registered non-fiat token: deliberately
+				// not a fiat dependency. See asset/known.go.
+			default:
+				// Unregistered hop: the false-negative documented in
+				// asset/known.go. Not a fiat dependency, and collected so
+				// the coverage gap is visible instead of silent.
+				unknown[h.Code+":"+h.Issuer] = h
 			}
 		}
 		if fiatHops == 0 {
@@ -494,8 +594,14 @@ func classify(paths []dex.Path, dest asset.Asset) (Integrity, []asset.Asset) {
 		}
 	}
 
+	unknownList := make([]asset.Asset, 0, len(unknown))
+	for _, a := range unknown {
+		unknownList = append(unknownList, a)
+	}
+	sort.Slice(unknownList, func(i, j int) bool { return unknownList[i].Code < unknownList[j].Code })
+
 	if independent {
-		return IntegrityDirect, nil
+		return IntegrityDirect, nil, unknownList
 	}
 
 	deps := make([]asset.Asset, 0, len(seen))
@@ -503,7 +609,7 @@ func classify(paths []dex.Path, dest asset.Asset) (Integrity, []asset.Asset) {
 		deps = append(deps, a)
 	}
 	sort.Slice(deps, func(i, j int) bool { return deps[i].Code < deps[j].Code })
-	return IntegrityDerivative, deps
+	return IntegrityDerivative, deps, unknownList
 }
 
 // quoteDEX prices the on-chain leg via Horizon pathfinding, and classifies
@@ -514,7 +620,7 @@ func (e *Engine) quoteDEX(ctx context.Context, req Request, ref refrate.Rate) (*
 		return nil, err
 	}
 
-	integrity, dependsOn := classify(paths, req.ReceiveAsset)
+	integrity, dependsOn, unknownHops := classify(paths, req.ReceiveAsset)
 	if integrity == IntegrityNoMarket {
 		return &dexResult{integrity: integrity}, nil
 	}
@@ -532,10 +638,12 @@ func (e *Engine) quoteDEX(ctx context.Context, req Request, ref refrate.Rate) (*
 		Kind:          KindDEX,
 		Description:   best.Describe(),
 		Source:        "stellar-dex",
+		Hops:          best.Hops,
 		SendAsset:     req.SendAsset,
 		SendAmount:    req.SendAmount,
 		ReceiveAsset:  req.ReceiveAsset,
 		ReceiveAmount: best.DestAmount,
+		PathCount:     distinctPathCount(paths),
 		QuotedAt:      time.Now(),
 	}
 	q.score(ref.Mid, ref.Source)
@@ -577,5 +685,5 @@ func (e *Engine) quoteDEX(ctx context.Context, req Request, ref refrate.Rate) (*
 			}
 		}
 	}
-	return &dexResult{quote: q, integrity: integrity, dependsOn: dependsOn}, nil
+	return &dexResult{quote: q, integrity: integrity, dependsOn: dependsOn, unknownHops: unknownHops}, nil
 }

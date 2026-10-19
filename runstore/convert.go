@@ -18,9 +18,36 @@ func FromCorridorJSON(c route.CorridorJSON) *Record {
 		Corridor:  CorridorKey(c.SendAsset.Code, c.ReceiveAsset.Code),
 		Integrity: c.Integrity,
 		DependsOn: []string{},
+		// SecondaryMid, SecondarySource and DivergencePct are carried
+		// through unconditionally: the wire shape already reports them
+		// whenever a cross-check ran, and dropping them here would mean a
+		// stale replay of a corridor that was cross-checked reads back as
+		// one that was not — see TestFromCorridorJSONCarriesReferenceCrossCheck.
+		//
+		// ScoredAgainst mirrors c.ReferenceSource only when the corridor was
+		// scorable at all: an unscorable rate never produced a verdict, so
+		// naming a source here would claim one did.
+		//
+		// FetchedAt is carried because the wire publishes reference_fetched_at
+		// and a stale replay must reproduce it: a reader needs to know how
+		// old the benchmark was when the reading was taken. It lives on the
+		// record as the Version 3 field (see Reference and docs/run-store.md).
+		//
+		// SecondaryAsOf and the parallel/street-market block still have no
+		// home in this record shape — see the note on Record's field-addition
+		// rule. Adding them is a Record layout change with its own migration
+		// and review bar, so it is flagged here rather than done as part of
+		// this fix.
 		Reference: Reference{
-			Mid:    c.ReferenceMid,
-			Source: c.ReferenceSource,
+			Mid:             c.ReferenceMid,
+			Source:          c.ReferenceSource,
+			AsOf:            c.ReferenceAsOf,
+			FetchedAt:       c.ReferenceFetchedAt,
+			SecondaryMid:    c.ReferenceSecondaryMid,
+			SecondarySource: c.ReferenceSecondarySource,
+			SecondaryAsOf:   c.ReferenceSecondaryAsOf,
+			DivergencePct:   c.ReferenceDivergencePct,
+			ScoredAgainst:   scoredAgainst(c),
 		},
 		FloorLossPct:    c.Floor,
 		FloorSize:       c.FloorSize,
@@ -29,6 +56,15 @@ func FromCorridorJSON(c route.CorridorJSON) *Record {
 		RecommendedSize: c.RecommendedSize,
 		Finding:         c.Finding,
 		Rungs:           make([]Rung, 0, len(c.Rungs)),
+	}
+
+	// Findings are carried into storage word-for-word, so a history-served
+	// reading shows exactly the checks and metrics the live one did. Absent
+	// (nil) when no checks ran — the wire shape's `findings` block is
+	// itself omitempty, mirroring that absence here.
+	if c.Findings != nil {
+		r.Checks = c.Findings.Checks
+		r.Metrics = c.Findings.Metrics
 	}
 
 	for _, d := range c.DependsOn {
@@ -70,6 +106,16 @@ func FromCorridorJSON(c route.CorridorJSON) *Record {
 	return r
 }
 
+// scoredAgainst names the source a corridor's verdicts were graded against,
+// or empty when the corridor was never scorable — an unscorable rate never
+// produced a verdict, so this must not claim one did.
+func scoredAgainst(c route.CorridorJSON) string {
+	if !c.Scored {
+		return ""
+	}
+	return c.ReferenceSource
+}
+
 // Nop is a Store that discards everything.
 //
 // It exists so callers never branch on a nil store. wayfared with no history
@@ -80,5 +126,6 @@ type Nop struct{}
 func (Nop) Append(context.Context, *Record) error                  { return nil }
 func (Nop) Latest(context.Context, string) (*Record, error)        { return nil, nil }
 func (Nop) Recent(context.Context, string, int) ([]*Record, error) { return nil, nil }
+func (Nop) All(context.Context, string) ([]*Record, error)         { return nil, nil }
 func (Nop) Verify(context.Context, string) error                   { return nil }
 func (Nop) Corridors(context.Context) ([]string, error)            { return nil, nil }
